@@ -1,1 +1,1 @@
-# DAML Dashboard Extension.
+# DAML
