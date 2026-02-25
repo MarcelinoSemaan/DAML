@@ -13,44 +13,44 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
- "contributes": {
-  "viewsContainers": {
-    "panel": [
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "daml-explorer",
+          "title": "DAML Protection",
+          "icon": "$(shield)"
+        }
+      ]
+    },
+    "views": {
+      "daml-explorer": [
+        {
+          "type": "webview",
+          "id": "daml.dashboardView",
+          "name": "Dashboard"
+        }
+      ]
+    },
+    "commands": [
       {
-        "id": "daml-panel",
-        "title": "DAML Protection",
-        "icon": "$(shield)"
+        "command": "daml.showMenu",
+        "title": "DAML: Show Quick Pick Menu"
+      },
+      {
+        "command": "daml.showDashboard",
+        "title": "DAML: Open Dashboard"
+      },
+      {
+        "command": "daml.scanWorkspace",
+        "title": "DAML: Scan Workspace"
+      },
+      {
+        "command": "daml.toggleStatusView",
+        "title": "DAML: Turn Protection On/Off"
       }
     ]
   },
-  "views": {
-    "daml-panel": [
-      {
-        "type": "webview",
-        "id": "daml.statusView",
-        "name": "Status"
-      }
-    ]
-  },
-  "commands": [
-    {
-      "command": "daml.showMenu",
-      "title": "DAML: Show Quick Pick Menu"
-    },
-    {
-      "command": "daml.showDashboard",
-      "title": "DAML: Open Dashboard"
-    },
-    {
-      "command": "daml.scanWorkspace",
-      "title": "DAML: Scan Workspace"
-    },
-    {
-      "command": "daml.toggleStatusView",
-      "title": "DAML: Turn Protection On/Off"
-    }
-  ]
-},
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "webpack",
