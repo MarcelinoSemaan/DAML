@@ -106,32 +106,22 @@ print(f"Parameters: {n_params:,}")
 nan_batches = 0  # global counter so we can report at end of epoch
 
 def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
-    global nan_batches
     nan_batches = 0
     model.train() if train else model.eval()
     total_loss, all_labels, all_probs = 0.0, [], []
 
-    bar = tqdm(loader, desc=desc, leave=False,
-               bar_format="{l_bar}{bar:30}{r_bar}")
-
     for xb, yb in bar:
-        xb = xb.to(DEVICE, non_blocking=True)
-        yb = yb.to(DEVICE, non_blocking=True)
-
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
         with torch.amp.autocast('cuda'):
             logits = model(xb)
-            loss   = criterion(logits, yb)
+            logits = torch.clamp(logits, -1e6, 1e6)
+            loss = criterion(logits, yb)
 
-        # ── NaN loss guard ────────────────────────────────────────────────────
         if torch.isnan(loss) or torch.isinf(loss):
             nan_batches += 1
             if train:
                 optimizer.zero_grad(set_to_none=True)
             continue
-        if len(labels) == 0 or len(preds) == 0:
-            print("⚠️  Warning: No valid batches processed in this epoch!")
-            return float('nan'), float('nan')  # or 0.0, 0.0
-            accuracy = accuracy_score(labels, preds)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
@@ -142,21 +132,18 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
             scaler.update()
 
         total_loss += loss.item()
-
-        # Clamp logits before sigmoid to prevent ±Inf → NaN
         safe_probs = torch.sigmoid(torch.clamp(logits, -20, 20)).detach().cpu().numpy()
         all_probs.extend(safe_probs)
         all_labels.extend(yb.cpu().numpy())
-        bar.set_postfix(loss=f"{loss.item():.4f}")
 
-    if nan_batches > 0:
-        print(f"  ⚠  {nan_batches} NaN/Inf batches skipped this epoch")
+    if len(all_labels) == 0:
+        print("⚠️  Warning: No valid batches processed in this epoch!")
+        return float('nan'), 0.0, 0.0, 0.0
 
     labels = np.array(all_labels)
     probs  = np.nan_to_num(np.array(all_probs), nan=0.5, posinf=1.0, neginf=0.0)
     preds  = (probs > 0.5).astype(int)
 
-    # Guard roc_auc_score: needs at least one sample of each class
     try:
         auc = roc_auc_score(labels, probs)
     except ValueError:
@@ -166,7 +153,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
             accuracy_score(labels, preds),
             auc,
             f1_score(labels, preds, zero_division=0))
-
+            
 # ── Optimiser / scheduler / scaler ───────────────────────────────────────────
 criterion = nn.BCEWithLogitsLoss()
 optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
