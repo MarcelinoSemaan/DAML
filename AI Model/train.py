@@ -128,6 +128,10 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
             if train:
                 optimizer.zero_grad(set_to_none=True)
             continue
+        if len(labels) == 0 or len(preds) == 0:
+            print("⚠️  Warning: No valid batches processed in this epoch!")
+            return float('nan'), float('nan')  # or 0.0, 0.0
+            accuracy = accuracy_score(labels, preds)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
