@@ -80,6 +80,81 @@ print("extractor.dim:", ndim)
 print("X_train.dat size (elements):", X.size)
 print("rows (size // dim):", X.size // ndim)
 print("remainder (size % dim):", X.size % ndim)
+import numpy as np, os
+DATA_DIR = '/home/marcelino/Desktop/Data/Dataset/Vectorised-Data'
+path = os.path.join(DATA_DIR, "X_train.dat")
+nd = 2568
+X = np.memmap(path, dtype=np.float32, mode='r')[:nd*5].reshape(5, nd)
+print("finite_all:", np.isfinite(X).all())
+print("nan_count:", int(np.isnan(X).sum()))
+print("inf_count:", int(np.isinf(X).sum()))
+print("rows checked:", X.shape[0], "cols:", X.shape[1])
+import numpy as np, os
+DATA_DIR = '/home/marcelino/Desktop/Data/Dataset/Vectorised-Data'
+path = os.path.join(DATA_DIR, "X_train.dat")
+nd = 2568
+X = np.memmap(path, dtype=np.float32, mode='r')[:nd*5].reshape(5, nd)
+print("finite_all:", np.isfinite(X).all())
+print("nan_count:", int(np.isnan(X).sum()))
+print("inf_count:", int(np.isinf(X).sum()))
+print("rows checked:", X.shape[0], "cols:", X.shape[1])
+import numpy as np, torch
+from pathlib import Path
+import thrember
+
+DATA_DIR = Path('/home/marcelino/Desktop/Data/Dataset/Vectorised-Data')
+# memmap labels
+y = np.memmap(DATA_DIR / "y_train.dat", dtype=np.int32, mode='r')
+print("y.size:", y.size, "unique sample:", np.unique(y)[:10])
+
+# instantiate extractor and dataset
+from train import EmberDataset, N_TIMESTEPS, N_FEATURES  # adjust import if filename differs
+extractor = thrember.PEFeatureExtractor()
+print("extractor.dim:", extractor.dim)
+
+# Inspect first 5 items from EmberDataset
+X = np.memmap(DATA_DIR / "X_train.dat", dtype=np.float32, mode='r').reshape(-1, extractor.dim)
+ds = EmberDataset(X, y)
+for i in range(5):
+    x_tensor, y_tensor = ds[i]
+    x = x_tensor.numpy()
+    print(f"idx={i} y={y_tensor.item()} shape={x.shape} finite_all={np.isfinite(x).all()} nan={int(np.isnan(x).sum())} inf={int(np.isinf(x).sum())}")
+import numpy as np, torch
+from pathlib import Path
+from train import EmberDataset, EmberLSTM, N_TIMESTEPS, N_FEATURES, DEVICE, BATCH_SIZE
+import thrember
+
+DATA_DIR = Path('/home/marcelino/Desktop/Data/Dataset/Vectorised-Data')
+X = np.memmap(DATA_DIR / "X_train.dat", dtype=np.float32, mode='r')
+y = np.memmap(DATA_DIR / "y_train.dat", dtype=np.int32, mode='r')
+X = X.reshape(-1, thrember.PEFeatureExtractor().dim)
+
+ds = EmberDataset(X, y)
+xb, yb = ds[0:BATCH_SIZE] if hasattr(ds, '__getitem__') and isinstance(ds[0], tuple) else None
+
+# If EmberDataset returns tensors per item, build a batch manually:
+if xb is None:
+    batch_X = np.stack([ds[i][0].numpy() for i in range(min(8, len(ds)))])
+    batch_y = np.array([ds[i][1].item() for i in range(min(8, len(ds)))]).astype(np.float32)
+else:
+    batch_X, batch_y = xb, yb
+
+batch_X = torch.tensor(batch_X, dtype=torch.float32).to(DEVICE)
+batch_y = torch.tensor(batch_y, dtype=torch.float32).to(DEVICE)
+
+model = EmberLSTM().to(DEVICE)
+model.eval()
+
+with torch.no_grad():
+    logits = model(batch_X)
+    print("logits shape:", logits.shape)
+    print("logits finite:", torch.isfinite(logits).all().item())
+    print("logits stats:", logits.min().item(), logits.max().item(), logits.mean().item(), logits.std().item())
+    criterion = torch.nn.BCEWithLogitsLoss()
+    loss = criterion(logits, batch_y)
+    print("loss:", loss.item(), "isfinite:", torch.isfinite(loss).item())
+
+
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 class EmberLSTM(nn.Module):
@@ -121,6 +196,8 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
     model.train() if train else model.eval()
     total_loss, all_labels, all_probs = 0.0, [], []
 
+    bar = tqdm(loader, desc=desc, leave=False, bar_format="{l_bar}{bar:30}{r_bar}")
+
     for xb, yb in bar:
         xb, yb = xb.to(DEVICE), yb.to(DEVICE)
         with torch.amp.autocast('cuda'):
@@ -141,6 +218,29 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
+        
+                # compute logits & loss
+        with torch.amp.autocast('cuda'):
+            logits = model(xb)
+            logits = torch.clamp(logits, -1e6, 1e6)
+            loss = criterion(logits, yb)
+
+        # if loss is NaN/Inf, print diagnostics then skip
+        if torch.isnan(loss) or torch.isinf(loss):
+            nan_batches += 1
+            # diagnostics
+            try:
+                lmin = logits.min().detach().cpu().item()
+                lmax = logits.max().detach().cpu().item()
+                lmean = logits.mean().detach().cpu().item()
+                finite_logits = torch.isfinite(logits).all().item()
+            except Exception:
+                lmin = lmax = lmean = None
+                finite_logits = False
+            print(f"Skipping batch #{nan_batches}: loss={loss.item() if isinstance(loss, torch.Tensor) else loss} | logits_finite={finite_logits} | logits_min={lmin} max={lmax} mean={lmean} | labels_finite={np.isfinite(yb.cpu().numpy()).all()} | labels_unique={np.unique(yb.cpu().numpy())[:10]}")
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+            continue
 
         total_loss += loss.item()
         safe_probs = torch.sigmoid(torch.clamp(logits, -20, 20)).detach().cpu().numpy()
@@ -171,7 +271,7 @@ optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 scheduler = OneCycleLR(optimizer, max_lr=1e-4,
                        steps_per_epoch=len(train_loader), epochs=EPOCHS,
                        pct_start=0.3, div_factor=10, final_div_factor=100)
-scaler    = torch.amp.GradScaler('cuda')
+scaler = torch.amp.GradScaler()
 history   = []
 best_auc  = 0.0
 

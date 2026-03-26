@@ -33,12 +33,8 @@ if DEVICE.type == "cuda":
 # ── Data ──────────────────────────────────────────────────────────────────────
 def load_data(data_dir):
     data_dir  = Path(data_dir)
-    extractor = thrember.PEFeatureExtractor()
-    ndim      = extractor.dim
-    X_tr = np.memmap(data_dir / "X_train.dat", dtype=np.float32, mode="r").reshape(-1, ndim)
-    y_tr = np.memmap(data_dir / "y_train.dat", dtype=np.int32,   mode="r")
-    X_te = np.memmap(data_dir / "X_test.dat",  dtype=np.float32, mode="r").reshape(-1, ndim)
-    y_te = np.memmap(data_dir / "y_test.dat",  dtype=np.int32,   mode="r")
+    X_train, y_train = thrember.read_vectorized_features(data_dir, subset="train")
+    X_test, y_test = thrember.read_vectorized_features(data_dir, subset="test")
     return X_tr, y_tr, X_te, y_te
 
 x_train, y_train, x_test, y_test = load_data(DATA_DIR)
@@ -110,8 +106,10 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
     model.train() if train else model.eval()
     total_loss, all_labels, all_probs = 0.0, [], []
 
+    bar = tqdm(loader, desc=desc, leave=False, bar_format="{l_bar}{bar:30}{r_bar}")
+
     for xb, yb in bar:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        xb, yb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True)
         with torch.amp.autocast('cuda'):
             logits = model(xb)
             logits = torch.clamp(logits, -1e6, 1e6)
@@ -135,6 +133,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, train=True, desc=""):
         safe_probs = torch.sigmoid(torch.clamp(logits, -20, 20)).detach().cpu().numpy()
         all_probs.extend(safe_probs)
         all_labels.extend(yb.cpu().numpy())
+        bar.set_postfix(loss=f"{loss.item():.4f}")
 
     if len(all_labels) == 0:
         print("⚠️  Warning: No valid batches processed in this epoch!")
