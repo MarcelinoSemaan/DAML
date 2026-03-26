@@ -31,15 +31,100 @@ if DEVICE.type == "cuda":
     print(f"VRAM   : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
 # ── Data ──────────────────────────────────────────────────────────────────────
+import json
+import pandas as pd
+from pathlib import Path
+
 def load_data(data_dir):
-    data_dir  = Path(data_dir)
-    X_train, y_train = thrember.read_vectorized_features(data_dir, subset="train")
-    X_test, y_test = thrember.read_vectorized_features(data_dir, subset="test")
-    return X_tr, y_tr, X_te, y_te
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import thrember
 
-x_train, y_train, x_test, y_test = load_data(DATA_DIR)
-print(f"Train  : {x_train.shape}  Test: {x_test.shape}")
+# ── Ember/Thrember feature dimensions (adjust if using a different version) ──
+EMBER_NUM_FEATURES = 2381   # default for ember2018; change to 2351 for older builds
 
+def _memmap_features(data_dir: Path, subset: str):
+    """
+    Memory-map the raw .dat files instead of loading them fully into RAM.
+    Falls back to thrember.read_vectorized_features if the .dat files
+    aren't in the expected location.
+    """
+    X_path = data_dir / f"X_{subset}.dat"
+    y_path = data_dir / f"y_{subset}.dat"
+
+    if X_path.exists() and y_path.exists():
+        # mmap_mode='r' → file stays on disk, OS pages in only what's touched
+        X = np.memmap(str(X_path), dtype=np.float32, mode="r").reshape(-1, EMBER_NUM_FEATURES)
+        y = np.memmap(str(y_path), dtype=np.float32, mode="r")
+        print(f"  [{subset}] memory-mapped  X={X.shape}  y={y.shape}")
+        return X, y
+    else:
+        # fallback — will load fully into RAM
+        print(f"  [{subset}] .dat not found, falling back to thrember loader (full RAM load)")
+        return thrember.read_vectorized_features(str(data_dir), subset=subset)
+
+
+def load_data(data_dir):
+    data_dir = Path(data_dir)
+
+    # ── 1. Stream JSONL files in chunks ──────────────────────────────────────
+    files       = sorted(data_dir.glob("*.jsonl"))
+    total_files = len(files)
+    file_count  = line_count = bad_lines = 0
+    chunks  = []
+    records = []
+    CHUNK   = 50_000          # rows per flush; lower if records are wide
+
+    for p in files:
+        file_count += 1
+        print(f"Processing file {file_count}/{total_files}: {p}")
+
+        with p.open("r", encoding="utf-8") as f:
+            for i, raw in enumerate(f, start=1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    records.append(json.loads(raw))
+                    line_count += 1
+                except json.JSONDecodeError:
+                    bad_lines += 1
+
+                if len(records) >= CHUNK:
+                    chunks.append(pd.DataFrame.from_records(records))
+                    records.clear()
+
+        print(f"  -> lines read: {i}, valid: {line_count}, bad: {bad_lines}")
+
+    if records:
+        chunks.append(pd.DataFrame.from_records(records))
+        records.clear()
+
+    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    del chunks, records                  # free staging memory NOW
+    print(f"Finished JSONL. Files: {total_files}, Records: {len(df)}, Bad lines: {bad_lines}")
+
+    # ── 2. Memory-map train features ─────────────────────────────────────────
+    print("Loading vectorized features (train)…")
+    X_train, y_train = _memmap_features(data_dir, "train")
+
+    # ── 3. Memory-map test features (this was the OOM trigger) ───────────────
+    print("Loading vectorized features (test)…")
+    X_test, y_test = _memmap_features(data_dir, "test")
+
+    return df, X_train, y_train, X_test, y_test
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+DATA_DIR = "/home/marcelino/Desktop/Data/Dataset/Vectorised-Data"
+
+df, X_train, y_train, X_test, y_test = load_data(DATA_DIR)
+
+print(f"JSONL DataFrame : {df.shape}")
+print(f"Train features  : {X_train.shape}  labels: {y_train.shape}")
+print(f"Test  features  : {X_test.shape}   labels: {y_test.shape}")
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class EmberDataset(Dataset):
     def __init__(self, X, y):
@@ -57,10 +142,10 @@ class EmberDataset(Dataset):
         return (torch.tensor(x, dtype=torch.float32),
                 torch.tensor(y, dtype=torch.float32))
 
-train_loader = DataLoader(EmberDataset(x_train, y_train),
+train_loader = DataLoader(EmberDataset(X_train, y_train),
                           batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=N_WORKERS, pin_memory=True)
-test_loader  = DataLoader(EmberDataset(x_test, y_test),
+test_loader  = DataLoader(EmberDataset(X_test, y_test),
                           batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=N_WORKERS, pin_memory=True)
 
