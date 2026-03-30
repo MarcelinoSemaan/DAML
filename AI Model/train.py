@@ -36,14 +36,14 @@ import pandas as pd
 from pathlib import Path
 
 def load_data(data_dir):
-import json
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import thrember
+    import json
+    import numpy as np
+    import pandas as pd
+    from pathlib import Path
+    import thrember
 
-# ── Ember/Thrember feature dimensions (adjust if using a different version) ──
-EMBER_NUM_FEATURES = 2381   # default for ember2018; change to 2351 for older builds
+    # ── Ember/Thrember feature dimensions (adjust if using a different version) ──
+    EMBER_NUM_FEATURES = 2381   # default for ember2018; change to 2351 for older builds
 
 def _memmap_features(data_dir: Path, subset: str):
     """
