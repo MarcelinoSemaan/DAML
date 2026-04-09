@@ -1,24 +1,19 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import * as http from 'http';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const execPromise = promisify(exec);
 
-// FastAPI configuration
 const API_BASE_URL = 'http://localhost:8000';
 
 export function activate(context: vscode.ExtensionContext) {
     const provider = new DamlDashboardProvider(context);
 
-    // Register the sidebar provider
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('daml.dashboardView', provider)
-    );
-
-    // Command to toggle protection from the status bar or menu
-    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('daml.dashboardView', provider),
         vscode.commands.registerCommand('daml.toggleStatusView', () => provider.toggleExtension()),
         vscode.commands.registerCommand('daml.showMenu', () => provider.showQuickPickMenu()),
         vscode.commands.registerCommand('daml.scanWorkspace', () => provider.scanWorkspace()),
@@ -40,20 +35,29 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         this.updateStatusBar();
         this.statusBarItem.show();
         
-        // Check API health on startup
         this.checkApiHealth();
+        setInterval(() => this.checkApiHealth(), 5000);
     }
 
     private async checkApiHealth(): Promise<void> {
         try {
-            const health = await this.apiRequest('/health');
-            this.apiAvailable = health.status === 'ok';
-            if (this.apiAvailable) {
-                console.log(`✅ DAML API connected: ${health.device}`);
+            const health = await this.apiRequest('/health').catch(() => ({status: 'error'}));
+            const wasAvailable = this.apiAvailable;
+            this.apiAvailable = health && health.status === 'ok';
+            
+            if (this.apiAvailable && !wasAvailable) {
+                this.updateWebview();
+                this.updateStatusBar();
+            } else if (!this.apiAvailable && wasAvailable) {
+                this.updateWebview();
+                this.updateStatusBar();
             }
         } catch (e) {
-            this.apiAvailable = false;
-            console.warn('⚠️ DAML API not available. Make sure FastAPI server is running on port 8000');
+            if (this.apiAvailable) {
+                this.apiAvailable = false;
+                this.updateWebview();
+                this.updateStatusBar();
+            }
         }
     }
 
@@ -61,7 +65,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         return new Promise((resolve, reject) => {
             const postData = body ? JSON.stringify(body) : '';
             const options = {
-                hostname: 'localhost',
+                hostname: '127.0.0.1',
                 port: 8000,
                 path: endpoint,
                 method: method,
@@ -91,7 +95,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
 
     public resolveWebviewView(webviewView: vscode.WebviewView) {
         this._view = webviewView;
-
         webviewView.webview.options = {
             enableScripts: true,
             localResourceRoots: [vscode.Uri.file(path.join(this.context.extensionPath, 'media'))]
@@ -141,21 +144,25 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         }
 
         vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: "DAML Scanning Workspace..." }, 
-            async (progress) => {
-                const files = await vscode.workspace.findFiles('**/*.{exe,dll,elf}', '**/node_modules/**', 100);
+            { location: vscode.ProgressLocation.Notification, title: "DAML Scanning Workspace...", cancellable: true }, 
+            async (progress, token) => {
+                const sourceFiles = await vscode.workspace.findFiles('**/*.{ts,js,py,cpp,c}', '**/node_modules/**', 50);
+                
+                if (sourceFiles.length === 0) {
+                    vscode.window.showInformationMessage('No source files found.');
+                    return;
+                }
+
                 let scanned = 0;
                 const threats: typeof this.recentDetections = [];
 
-                for (const file of files) {
-                    progress.report({ message: `Scanning ${path.basename(file.fsPath)}...`, increment: 100 / files.length });
+                for (const file of sourceFiles) {
+                    if (token.isCancellationRequested) break;
+                    progress.report({ message: `Processing ${path.basename(file.fsPath)}...`, increment: 100 / sourceFiles.length });
                     
                     try {
-                        // Extract features using Python subprocess with thrember
-                        const features = await this.extractFeatures(file.fsPath);
-                        const result = await this.apiRequest('/predict', 'POST', { features });
-                        
-                        if (result.is_malicious) {
+                        const result = await this.buildAndScan(file.fsPath, false);
+                        if (result && result.is_malicious) {
                             threats.push({
                                 file: path.basename(file.fsPath),
                                 severity: result.confidence === 'high' ? 'critical' : result.confidence,
@@ -164,23 +171,20 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                             });
                         }
                     } catch (err) {
-                        console.error(`Failed to scan ${file.fsPath}:`, err);
+                        console.log(`Skipping ${file.fsPath}: ${err}`);
                     }
-                    
                     scanned++;
-                    await new Promise(r => setTimeout(r, 100)); // Rate limiting
                 }
 
                 this.threatCount += threats.length;
                 this.recentDetections = [...threats, ...this.recentDetections].slice(0, 10);
-                
                 this.updateStatusBar();
                 this.updateWebview();
                 
                 if (threats.length > 0) {
                     vscode.window.showWarningMessage(`DAML: Found ${threats.length} potential threats!`);
                 } else {
-                    vscode.window.showInformationMessage(`DAML: Workspace scan complete. No threats detected.`);
+                    vscode.window.showInformationMessage(`DAML: Scanned ${scanned} files. No threats.`);
                 }
             }
         );
@@ -190,102 +194,367 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
         
         const editor = vscode.window.activeTextEditor;
-        if (!editor) return vscode.window.showWarningMessage('No active file to scan.');
+        if (!editor) return vscode.window.showWarningMessage('No active file.');
         
-        const filePath = editor.document.fileName;
+        const sourcePath = editor.document.fileName;
+        const ext = path.extname(sourcePath).toLowerCase();
         
-        // Check if it's a binary file we can analyze
-        if (!filePath.match(/\.(exe|dll|elf)$/i)) {
-            return vscode.window.showWarningMessage('DAML: Active file is not a supported binary format (.exe, .dll, .elf)');
+        if (['.exe', '.dll', '.elf'].includes(ext)) {
+            return this.scanBinary(sourcePath);
         }
         
-        vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: "DAML Scanning active file..." },
+        if (!['.ts', '.js', '.py', '.cpp', '.c', '.rs'].includes(ext)) {
+            return vscode.window.showWarningMessage(`Unsupported: ${ext}. Use .js, .ts, .py, .cpp, .c`);
+        }
+        
+        await this.buildAndScan(sourcePath, true);
+    }
+
+    private async buildAndScan(sourcePath: string, showProgress: boolean): Promise<any | null> {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
+        const fileName = path.basename(sourcePath);
+        
+        // Check if binary already exists
+        let binaryPath = await this.findExistingBinary(sourcePath, workspaceRoot);
+        if (binaryPath) {
+            return this.scanBinary(binaryPath, showProgress);
+        }
+        
+        if (!showProgress) return null;
+        
+        // Build the project
+        const action = await vscode.window.showWarningMessage(
+            `No EXE found for ${fileName}. Build now?`,
+            'Build & Scan', 'Cancel'
+        );
+        
+        if (action !== 'Build & Scan') return null;
+        
+        // Run build with progress
+        let builtBinaryPath: string | null = null;
+        
+        await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: "Building project...", cancellable: false },
             async (progress) => {
+                progress.report({ message: "Starting build..." });
+                
                 try {
-                    progress.report({ message: 'Extracting features...' });
-                    const features = await this.extractFeatures(filePath);
+                    // Try to build
+                    await this.runBuildCommand(sourcePath, workspaceRoot);
                     
-                    progress.report({ message: 'Running model inference...' });
-                    const result = await this.apiRequest('/predict', 'POST', { features });
+                    progress.report({ message: "Building... waiting for output (this may take 30s-2min)..." });
                     
-                    if (result.is_malicious) {
-                        this.threatCount++;
-                        this.recentDetections.unshift({
-                            file: path.basename(filePath),
-                            severity: result.confidence === 'high' ? 'critical' : result.confidence,
-                            time: 'just now',
-                            prob: result.malicious_probability
-                        });
-                        this.recentDetections = this.recentDetections.slice(0, 10);
+                    // Poll for the binary - try for up to 2 minutes
+                    for (let i = 0; i < 120; i++) {
+                        await new Promise(r => setTimeout(r, 1000));
                         
-                        this.updateStatusBar();
-                        this.updateWebview();
-                        vscode.window.showWarningMessage(`DAML: Threat detected in ${path.basename(filePath)}! (${(result.malicious_probability * 100).toFixed(1)}% confidence)`);
-                    } else {
-                        vscode.window.showInformationMessage(`DAML: File appears safe (${(result.malicious_probability * 100).toFixed(1)}% malicious probability)`);
+                        builtBinaryPath = await this.findExistingBinary(sourcePath, workspaceRoot);
+                        if (builtBinaryPath) break;
+                        
+                        if (i % 5 === 0) {
+                            progress.report({ message: `Still building... (${i}s)` });
+                        }
                     }
                 } catch (err) {
-                    vscode.window.showErrorMessage(`DAML: Scan failed - ${err}`);
+                    vscode.window.showErrorMessage(`Build failed: ${err}`);
                 }
             }
         );
+        
+        if (!builtBinaryPath) {
+            // Last resort: find any .exe created in last 5 minutes
+            builtBinaryPath = await this.findRecentExeAnywhere(workspaceRoot);
+        }
+        
+        if (!builtBinaryPath || !fs.existsSync(builtBinaryPath)) {
+            vscode.window.showErrorMessage(
+                'Build completed but no .exe found. Check your build output in dist/ or build/ folders.',
+                'Open Folder'
+            ).then(sel => {
+                if (sel === 'Open Folder') {
+                    const distPath = path.join(workspaceRoot, 'dist');
+                    if (fs.existsSync(distPath)) {
+                        vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(distPath));
+                    } else {
+                        vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(workspaceRoot));
+                    }
+                }
+            });
+            return null;
+        }
+        
+        vscode.window.showInformationMessage(`Build complete! Found: ${path.basename(builtBinaryPath)}`);
+        return this.scanBinary(builtBinaryPath, showProgress);
+    }
+
+    private async runBuildCommand(sourcePath: string, workspaceRoot: string): Promise<void> {
+        const ext = path.extname(sourcePath).toLowerCase();
+        
+        if (ext === '.js' || ext === '.ts') {
+            // Check if package.json exists
+            const pkgPath = path.join(workspaceRoot, 'package.json');
+            if (fs.existsSync(pkgPath)) {
+                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+                
+                // Check for pkg or nexe in dependencies
+                const hasPkg = pkg.devDependencies?.pkg || pkg.dependencies?.pkg;
+                const hasNexe = pkg.devDependencies?.nexe || pkg.dependencies?.nexe;
+                
+                if (hasPkg) {
+                    // Use pkg
+                    return new Promise((resolve, reject) => {
+                        const child = spawn('npx', ['pkg', '.', '--output', 'dist/app.exe'], {
+                            cwd: workspaceRoot,
+                            shell: true,
+                            stdio: 'pipe'
+                        });
+                        
+                        let errorOutput = '';
+                        child.stderr.on('data', (data) => { errorOutput += data; });
+                        
+                        child.on('close', (code) => {
+                            if (code === 0 || fs.existsSync(path.join(workspaceRoot, 'dist', 'app.exe'))) {
+                                resolve();
+                            } else {
+                                reject(new Error(`pkg failed: ${errorOutput}`));
+                            }
+                        });
+                    });
+                } else if (hasNexe) {
+                    return new Promise((resolve, reject) => {
+                        const child = spawn('npx', ['nexe', sourcePath, '-o', 'dist/app.exe'], {
+                            cwd: workspaceRoot,
+                            shell: true
+                        });
+                        child.on('close', (code) => code === 0 ? resolve() : reject(new Error('nexe failed')));
+                    });
+                } else if (pkg.scripts?.build) {
+                    // Run npm run build
+                    return new Promise((resolve, reject) => {
+                        const child = spawn('npm', ['run', 'build'], {
+                            cwd: workspaceRoot,
+                            shell: true
+                        });
+                        child.on('close', (code) => code === 0 ? resolve() : reject(new Error('npm build failed')));
+                    });
+                }
+            }
+            
+            // Fallback: try to use pkg directly on the file
+            return new Promise((resolve, reject) => {
+                const outDir = path.join(workspaceRoot, 'dist');
+                if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+                
+                const child = spawn('npx', ['pkg', sourcePath, '--target', 'node18-win-x64', '--output', 'dist/app.exe'], {
+                    cwd: workspaceRoot,
+                    shell: true,
+                    stdio: 'pipe'
+                });
+                
+                let errorOutput = '';
+                child.stderr.on('data', (data) => { errorOutput += data; });
+                
+                child.on('close', (code) => {
+                    if (code === 0 || fs.existsSync(path.join(workspaceRoot, 'dist', 'app.exe'))) {
+                        resolve();
+                    } else {
+                        reject(new Error(`pkg failed. Try installing it: npm install -g pkg\n${errorOutput}`));
+                    }
+                });
+            });
+            
+        } else if (ext === '.py') {
+            // PyInstaller
+            return new Promise((resolve, reject) => {
+                const child = spawn('pyinstaller', ['--onefile', sourcePath, '--distpath', 'dist'], {
+                    cwd: workspaceRoot,
+                    shell: true
+                });
+                child.on('close', (code) => code === 0 ? resolve() : reject(new Error('pyinstaller failed')));
+            });
+        } else if (ext === '.rs') {
+            // Cargo
+            return new Promise((resolve, reject) => {
+                const child = spawn('cargo', ['build', '--release'], {
+                    cwd: workspaceRoot,
+                    shell: true
+                });
+                child.on('close', (code) => code === 0 ? resolve() : reject(new Error('cargo build failed')));
+            });
+        } else if (['.cpp', '.c'].includes(ext)) {
+            // g++
+            return new Promise((resolve, reject) => {
+                const outFile = path.join(workspaceRoot, 'dist', 'app.exe');
+                if (!fs.existsSync(path.dirname(outFile))) {
+                    fs.mkdirSync(path.dirname(outFile), { recursive: true });
+                }
+                
+                const child = spawn('g++', [sourcePath, '-o', outFile], {
+                    cwd: workspaceRoot,
+                    shell: true
+                });
+                child.on('close', (code) => code === 0 ? resolve() : reject(new Error('g++ failed')));
+            });
+        }
+        
+        throw new Error(`No build command for ${ext}`);
+    }
+
+    private async findExistingBinary(sourcePath: string, workspaceRoot: string): Promise<string | null> {
+        const ext = path.extname(sourcePath).toLowerCase();
+        const baseName = path.basename(sourcePath, ext);
+        
+        // Common output directories and names
+        const checkPaths = [
+            path.join(workspaceRoot, 'dist', `${baseName}.exe`),
+            path.join(workspaceRoot, 'dist', 'app.exe'),
+            path.join(workspaceRoot, 'dist', 'index.exe'),
+            path.join(workspaceRoot, 'dist', 'main.exe'),
+            path.join(workspaceRoot, 'build', `${baseName}.exe`),
+            path.join(workspaceRoot, 'build', 'app.exe'),
+            path.join(workspaceRoot, `${baseName}.exe`),
+            path.join(workspaceRoot, 'target', 'release', `${baseName}.exe`),
+            path.join(workspaceRoot, 'target', 'release', 'app.exe'),
+            path.join(workspaceRoot, 'target', 'debug', `${baseName}.exe`),
+        ];
+        
+        for (const p of checkPaths) {
+            if (fs.existsSync(p)) return p;
+        }
+        
+        // Check package.json name
+        if (ext === '.js' || ext === '.ts') {
+            const pkgPath = path.join(workspaceRoot, 'package.json');
+            if (fs.existsSync(pkgPath)) {
+                try {
+                    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+                    if (pkg.name) {
+                        const nameExe = path.join(workspaceRoot, 'dist', `${pkg.name}.exe`);
+                        if (fs.existsSync(nameExe)) return nameExe;
+                    }
+                    if (pkg.bin) {
+                        const binName = Object.keys(pkg.bin)[0];
+                        if (binName) {
+                            const binExe = path.join(workspaceRoot, 'dist', `${binName}.exe`);
+                            if (fs.existsSync(binExe)) return binExe;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+        
+        return null;
+    }
+
+    private async findRecentExeAnywhere(workspaceRoot: string): Promise<string | null> {
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        
+        const searchDirs = [
+            path.join(workspaceRoot, 'dist'),
+            path.join(workspaceRoot, 'build'),
+            path.join(workspaceRoot, 'target', 'release'),
+            path.join(workspaceRoot, 'target', 'debug'),
+            path.join(workspaceRoot, 'bin'),
+            workspaceRoot
+        ];
+        
+        let newestExe: string | null = null;
+        let newestTime = 0;
+        
+        for (const dir of searchDirs) {
+            if (!fs.existsSync(dir)) continue;
+            
+            try {
+                const files = fs.readdirSync(dir);
+                for (const file of files) {
+                    if (file.endsWith('.exe')) {
+                        const fullPath = path.join(dir, file);
+                        const stats = fs.statSync(fullPath);
+                        if (stats.mtimeMs > fiveMinutesAgo && stats.mtimeMs > newestTime) {
+                            newestTime = stats.mtimeMs;
+                            newestExe = fullPath;
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+        
+        return newestExe;
+    }
+
+    private async scanBinary(binaryPath: string, showProgress: boolean = true): Promise<any> {
+        const doScan = async (progress?: vscode.Progress<{ message?: string; increment?: number }>) => {
+            try {
+                progress?.report({ message: 'Extracting features...' });
+                const features = await this.extractFeatures(binaryPath);
+                
+                progress?.report({ message: 'Analyzing with AI...' });
+                const result = await this.apiRequest('/predict', 'POST', { features });
+                
+                if (result.is_malicious) {
+                    this.threatCount++;
+                    this.recentDetections.unshift({
+                        file: path.basename(binaryPath),
+                        severity: result.confidence === 'high' ? 'critical' : result.confidence,
+                        time: 'just now',
+                        prob: result.malicious_probability
+                    });
+                    this.recentDetections = this.recentDetections.slice(0, 10);
+                    this.updateStatusBar();
+                    this.updateWebview();
+                    
+                    vscode.window.showWarningMessage(
+                        `⚠️ Threat in ${path.basename(binaryPath)}! (${(result.malicious_probability * 100).toFixed(0)}% confidence)`
+                    );
+                } else {
+                    if (showProgress) {
+                        vscode.window.showInformationMessage(
+                            `✅ ${path.basename(binaryPath)} safe (${(result.malicious_probability * 100).toFixed(1)}% risk)`
+                        );
+                    }
+                }
+                return result;
+            } catch (err) {
+                if (showProgress) vscode.window.showErrorMessage(`Scan failed: ${err}`);
+                throw err;
+            }
+        };
+
+        if (showProgress) {
+            return vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: `Scanning ${path.basename(binaryPath)}...` },
+                doScan
+            );
+        } else {
+            return doScan();
+        }
     }
 
     private async extractFeatures(filePath: string): Promise<number[]> {
-        // Path to Python script in extension folder
         const pythonDir = path.join(this.context.extensionPath, 'python');
         const scriptPath = path.join(pythonDir, 'extract_features.py');
+        const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
         
         try {
-            // Run Python feature extraction
             const { stdout, stderr } = await execPromise(
-                `python3 "${scriptPath}" "${filePath}"`,
-                {
-                    timeout: 30000,  // 30 second timeout
-                    maxBuffer: 1024 * 1024 * 2  // 2MB buffer for large feature arrays
-                }
+                `"${pythonCmd}" "${scriptPath}" "${filePath}"`,
+                { timeout: 30000, maxBuffer: 1024 * 1024 * 2 }
             );
             
-            if (stderr) {
-                console.warn('Feature extraction stderr:', stderr);
+            if (stderr && !stderr.includes('DeprecationWarning')) {
+                console.warn('stderr:', stderr);
             }
             
-            // Parse JSON output
             const features = JSON.parse(stdout.trim());
-            
-            // Validate features array
-            if (!Array.isArray(features)) {
-                throw new Error('Feature extraction returned non-array');
-            }
-            
-            if (features.length !== 2568) {
-                throw new Error(`Expected 2568 features, got ${features.length}`);
-            }
-            
-            // Validate all numbers are finite
-            const invalidCount = features.filter((f: number) => !Number.isFinite(f)).length;
-            if (invalidCount > 0) {
-                throw new Error(`Feature extraction returned ${invalidCount} invalid values`);
-            }
+            if (!Array.isArray(features)) throw new Error('Invalid output');
+            if (features.length !== 2568) throw new Error(`Expected 2568 features, got ${features.length}`);
             
             return features;
-            
         } catch (error: any) {
-            console.error('Feature extraction failed:', error);
-            
-            // Provide specific error messages
-            if (error.code === 'ENOENT') {
-                throw new Error('Python3 not found. Please install Python 3.x');
+            if (error.message?.includes('ModuleNotFoundError')) {
+                throw new Error('Python dependencies missing. Run: pip install lief numpy');
             }
-            if (error.killed) {
-                throw new Error('Feature extraction timed out (30s limit)');
-            }
-            if (error.message?.includes('JSON')) {
-                throw new Error('Feature extraction returned invalid data');
-            }
-            
-            throw new Error(`Failed to extract features: ${error.message || error}`);
+            throw new Error(`Feature extraction failed: ${error.message || error}`);
         }
     }
 
@@ -302,7 +571,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             ? `$(shield) DAML ${this.apiAvailable ? '●' : '○'}` 
             : `$(circle-slash) DAML Off`;
         this.statusBarItem.tooltip = this.apiAvailable 
-            ? `API Connected - ${this.threatCount} threats detected` 
+            ? `API Connected - ${this.threatCount} threats` 
             : 'API Disconnected';
         this.statusBarItem.backgroundColor = (this.isEnabled && this.threatCount > 0) 
             ? new vscode.ThemeColor('statusBarItem.warningBackground') 
@@ -311,12 +580,10 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
 
     private updateWebview() {
         if (!this._view) return;
-        
         if (!this.isEnabled) {
             this._view.webview.html = `<body style="display:flex;justify-content:center;align-items:center;height:100vh;opacity:0.5;">DAML is disabled</body>`;
             return;
         }
-
         const scriptUri = this._view.webview.asWebviewUri(
             vscode.Uri.file(path.join(this.context.extensionPath, 'media', 'dashboard.js'))
         );
@@ -375,70 +642,37 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                     --bg: var(--vscode-sideBar-background);
                     --fg: var(--vscode-foreground);
                     --border: var(--vscode-widget-border);
-                    --accent: var(--vscode-textLink-foreground);
                     --card-bg: var(--vscode-editor-background);
                     --hover-bg: var(--vscode-list-hoverBackground);
                 }
-                body { 
-                    background-color: var(--bg); 
-                    color: var(--fg); 
-                    font-family: var(--vscode-font-family); 
-                    overflow-x: hidden; 
-                    padding: 12px;
-                }
-                .card { 
-                    background: var(--card-bg); 
-                    border: 1px solid var(--border); 
-                    border-radius: 6px; 
-                }
-                .chart-container { 
-                    height: 160px; 
-                    width: 100%; 
-                    position: relative; 
-                }
+                body { background: var(--bg); color: var(--fg); font-family: var(--vscode-font-family); padding: 12px; overflow-x: hidden; }
+                .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; }
+                .chart-container { height: 160px; width: 100%; position: relative; }
                 ::-webkit-scrollbar { width: 6px; }
-                ::-webkit-scrollbar-track { background: transparent; }
                 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-                .pulse {
-                    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-                }
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: .5; }
-                }
+                .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+                @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
             </style>
         </head>
         <body class="flex flex-col h-[100vh]">
             <div class="flex flex-col space-y-4 flex-none">
-                
                 <div class="flex justify-between items-center border-b border-[var(--border)] pb-2">
                     <div class="flex items-center gap-2">
                         <i data-lucide="shield" class="w-4 h-4 ${this.apiAvailable ? 'text-green-400' : 'text-red-400'} ${this.apiAvailable ? '' : 'pulse'}"></i>
                         <h1 class="text-xs font-bold uppercase tracking-wider opacity-80">DAML Status</h1>
-                        ${!this.apiAvailable ? '<span class="text-[9px] text-red-400 ml-2">API Offline</span>' : ''}
+                        ${!this.apiAvailable ? '<span class="text-[9px] text-red-400 ml-2">Offline</span>' : ''}
                     </div>
-                    <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded text-[10px] transition cursor-pointer ${this.threatCount === 0 ? 'opacity-50' : ''}" 
-                            ${this.threatCount === 0 ? 'disabled' : ''}>
-                        Clear Alerts
-                    </button>
+                    <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded text-[10px] ${this.threatCount === 0 ? 'opacity-50' : ''}" ${this.threatCount === 0 ? 'disabled' : ''}>Clear</button>
                 </div>
 
                 <div class="grid grid-cols-2 gap-2">
                     <div class="card p-3 flex flex-col items-center justify-center text-center">
-                        <p class="text-[10px] opacity-60 uppercase mb-1 flex items-center gap-1">
-                            <i data-lucide="alert-triangle" class="w-3 h-3 ${this.threatCount > 0 ? 'text-red-500' : 'text-green-500'}"></i> Threats
-                        </p>
-                        <p class="text-2xl font-bold ${this.threatCount > 0 ? 'text-red-500' : 'text-green-500'}">
-                            ${this.threatCount}
-                        </p>
+                        <p class="text-[10px] opacity-60 uppercase mb-1"><i data-lucide="alert-triangle" class="w-3 h-3 ${this.threatCount > 0 ? 'text-red-500' : 'text-green-500'} inline"></i> Threats</p>
+                        <p class="text-2xl font-bold ${this.threatCount > 0 ? 'text-red-500' : 'text-green-500'}">${this.threatCount}</p>
                     </div>
                     <div class="card p-3 flex flex-col items-center justify-center text-center">
-                        <p class="text-[10px] opacity-60 uppercase mb-1 flex items-center gap-1">
-                            <i data-lucide="activity" class="w-3 h-3 ${this.apiAvailable ? 'text-green-500' : 'text-red-500'}"></i> API
-                        </p>
-                        <p class="text-2xl font-bold ${this.apiAvailable ? 'text-green-500' : 'text-red-500'}">
-                            ${this.apiAvailable ? 'ON' : 'OFF'}
-                        </p>
+                        <p class="text-[10px] opacity-60 uppercase mb-1"><i data-lucide="activity" class="w-3 h-3 ${this.apiAvailable ? 'text-green-500' : 'text-red-500'} inline"></i> API</p>
+                        <p class="text-2xl font-bold ${this.apiAvailable ? 'text-green-500' : 'text-red-500'}">${this.apiAvailable ? 'ON' : 'OFF'}</p>
                     </div>
                 </div>
 
@@ -447,15 +681,13 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 </div>
 
                 <div>
-                    <h2 class="text-[10px] font-bold uppercase opacity-60 mb-2">Quick Actions</h2>
+                    <h2 class="text-[10px] font-bold uppercase opacity-60 mb-2">Actions</h2>
                     <div class="grid grid-cols-2 gap-2">
-                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer transition ${!this.apiAvailable ? 'opacity-50' : ''}" 
-                                onclick="vscode.postMessage({command: 'scanWorkspace'})" ${!this.apiAvailable ? 'disabled' : ''}>
+                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ${!this.apiAvailable ? 'opacity-50' : ''}" onclick="vscode.postMessage({command: 'scanWorkspace'})" ${!this.apiAvailable ? 'disabled' : ''}>
                             <i data-lucide="folder-search" class="w-4 h-4 text-blue-400"></i>
                             <span>Scan Workspace</span>
                         </button>
-                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer transition ${!this.apiAvailable ? 'opacity-50' : ''}" 
-                                onclick="vscode.postMessage({command: 'scanActiveFile'})" ${!this.apiAvailable ? 'disabled' : ''}>
+                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ${!this.apiAvailable ? 'opacity-50' : ''}" onclick="vscode.postMessage({command: 'scanActiveFile'})" ${!this.apiAvailable ? 'disabled' : ''}>
                             <i data-lucide="file-search" class="w-4 h-4 text-purple-400"></i>
                             <span>Scan Active File</span>
                         </button>
@@ -474,45 +706,17 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
 
             <div class="mt-3 flex justify-between items-center text-[9px] opacity-50 border-t border-[var(--border)] pt-2 flex-none">
                 <span>Engine v2.1.4</span>
-                <span class="flex items-center gap-1">
-                    <i data-lucide="${this.apiAvailable ? 'check-circle' : 'x-circle'}" class="w-3 h-3 ${this.apiAvailable ? 'text-green-500' : 'text-red-500'}"></i> 
-                    ${this.apiAvailable ? 'Model Ready' : 'API Disconnected'}
-                </span>
+                <span><i data-lucide="${this.apiAvailable ? 'check-circle' : 'x-circle'}" class="w-3 h-3 ${this.apiAvailable ? 'text-green-500' : 'text-red-500'} inline"></i> ${this.apiAvailable ? 'Ready' : 'Disconnected'}</span>
             </div>
             
             <script>
                 const vscode = acquireVsCodeApi();
-                
-                document.getElementById('clear-btn')?.addEventListener('click', () => {
-                    vscode.postMessage({command: 'resolveThreats'});
-                });
-                
+                document.getElementById('clear-btn')?.addEventListener('click', () => vscode.postMessage({command: 'resolveThreats'}));
                 lucide.createIcons();
-                
-                // Chart.js for threat history
-                const ctx = document.getElementById('weeklyChart').getContext('2d');
-                new Chart(ctx, {
+                new Chart(document.getElementById('weeklyChart'), {
                     type: 'line',
-                    data: {
-                        labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
-                        datasets: [{
-                            label: 'Threats',
-                            data: [2, 1, ${this.threatCount}, 0, 1, 0, 0],
-                            borderColor: 'rgb(239, 68, 68)',
-                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                            fill: true,
-                            tension: 0.4
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: { legend: { display: false } },
-                        scales: {
-                            x: { display: false },
-                            y: { display: false, min: 0 }
-                        }
-                    }
+                    data: { labels: ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'], datasets: [{ label: 'Threats', data: [2,1,${this.threatCount},0,1,0,0], borderColor: 'rgb(239,68,68)', backgroundColor: 'rgba(239,68,68,0.1)', fill: true, tension: 0.4 }] },
+                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false, min: 0 } } }
                 });
             </script>
             <script src="${scriptUri}"></script>
