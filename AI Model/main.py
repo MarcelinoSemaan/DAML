@@ -3,37 +3,31 @@ from pydantic import BaseModel
 import torch
 import torch.nn as nn
 import numpy as np
-import pickle
 import math
 from typing import List
-from sklearn.preprocessing import StandardScaler  # Added for dummy scaler
 
 app = FastAPI(title="DAML API")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-TARGET_NF = 64
 
-# Load feature count from training metadata (or set manually)
-try:
-    with open('memmap_cache/train_meta.pkl', 'rb') as f:
-        N_COLS = pickle.load(f)['shape'][1]
-except:
-    N_COLS = 2568  # Default for thrember
+# MATCH YOUR TRAINED MODEL (64 features, not 107!)
+N_FEATURES = 64
+N_TIMESTEPS = 40    # 40 * 64 = 2560
+PAD_TO = 2560       # Model was trained with padding to 2560
 
-N_TIMESTEPS = max(1, math.ceil(N_COLS / TARGET_NF))
-N_FEATURES = TARGET_NF
-PAD_TO = N_TIMESTEPS * N_FEATURES
+# EMBER returns 2381 or 2568, we'll pad/truncate to 2560
+N_COLS_RAW = 2568   # What EMBER extract_features.py returns
 
 print(f"DAML API on {DEVICE}")
-print(f"Features: {N_COLS} → {PAD_TO} ({N_TIMESTEPS}×{N_FEATURES})")
+print(f"Raw features: {N_COLS_RAW} → pad to {PAD_TO} ({N_TIMESTEPS}×{N_FEATURES})")
 
-# ── Model ────────────────────────────────────────────────────────────────────
+# ── Model (matches your trained model with 64 features) ─────────────────────
 class EmberLSTM(nn.Module):
     def __init__(self, n_features: int, n_timesteps: int):
         super().__init__()
         self.input_proj = nn.Sequential(
-            nn.Linear(n_features, 128),
+            nn.Linear(n_features, 128),    # [128, 64] - matches your checkpoint
             nn.LayerNorm(128),
             nn.GELU()
         )
@@ -62,26 +56,10 @@ model = EmberLSTM(N_FEATURES, N_TIMESTEPS).to(DEVICE)
 try:
     model.load_state_dict(torch.load('ember_lstm_best.pt', map_location=DEVICE))
     model.eval()
-    print("✅ Model loaded")
+    print("✅ Model loaded successfully")
 except Exception as e:
     print(f"❌ Model error: {e}")
     raise
-
-# ── DUMMY SCALER (FOR TESTING ONLY) ────────────────────────────────────────────
-try:
-    with open('memmap_cache/scaler.pkl', 'rb') as f:
-        scaler = pickle.load(f)
-    print("✅ Real scaler loaded")
-except FileNotFoundError:
-    print("⚠️ WARNING: Using DUMMY scaler - predictions will be random!")
-    print("   Get the real scaler.pkl from training for accurate results.")
-    
-    # Create dummy scaler (identity transform - does nothing)
-    scaler = StandardScaler()
-    scaler.mean_ = np.zeros(N_COLS)
-    scaler.scale_ = np.ones(N_COLS)
-    scaler.n_features_in_ = N_COLS
-    scaler.var_ = np.ones(N_COLS)
 
 # ── API ───────────────────────────────────────────────────────────────────────
 class PredictRequest(BaseModel):
@@ -92,25 +70,32 @@ async def health():
     return {
         "status": "ok", 
         "device": str(DEVICE),
-        "scaler_type": "dummy" if np.all(scaler.scale_ == 1) else "real"
+        "model": "EmberLSTM",
+        "config": {
+            "n_features": N_FEATURES,
+            "n_timesteps": N_TIMESTEPS,
+            "pad_to": PAD_TO,
+            "input_raw": N_COLS_RAW
+        }
     }
 
 @app.post("/predict")
 async def predict(request: PredictRequest):
     try:
-        if len(request.features) != N_COLS:
-            raise ValueError(f"Expected {N_COLS} features, got {len(request.features)}")
+        # Accept 2568 features from EMBER extractor
+        if len(request.features) != N_COLS_RAW:
+            raise ValueError(f"Expected {N_COLS_RAW} features, got {len(request.features)}")
         
-        # Preprocess
+        # Preprocess: truncate from 2568 to 2560 (remove last 8 features)
         x = np.array(request.features, dtype=np.float32)
-        x = np.nan_to_num(x, nan=0.0)
-        x = scaler.transform(x.reshape(1, -1))[0]
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         
-        if len(x) < PAD_TO:
-            x = np.pad(x, (0, PAD_TO - len(x)))
+        # Truncate to match model's expected input size
+        x = x[:PAD_TO]
         
-        x = x.reshape(N_TIMESTEPS, N_FEATURES)
-        x = torch.tensor(x).unsqueeze(0).to(DEVICE)
+        # Reshape to (1, 40, 64)
+        x = x.reshape(1, N_TIMESTEPS, N_FEATURES)
+        x = torch.tensor(x).to(DEVICE)
         
         # Inference
         with torch.no_grad():

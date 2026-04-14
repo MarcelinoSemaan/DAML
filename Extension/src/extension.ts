@@ -7,8 +7,6 @@ import { promisify } from 'util';
 
 const execPromise = promisify(exec);
 
-const API_BASE_URL = 'http://localhost:8000';
-
 export function activate(context: vscode.ExtensionContext) {
     const provider = new DamlDashboardProvider(context);
 
@@ -17,7 +15,8 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('daml.toggleStatusView', () => provider.toggleExtension()),
         vscode.commands.registerCommand('daml.showMenu', () => provider.showQuickPickMenu()),
         vscode.commands.registerCommand('daml.scanWorkspace', () => provider.scanWorkspace()),
-        vscode.commands.registerCommand('daml.scanActiveFile', () => provider.scanActiveFile())
+        vscode.commands.registerCommand('daml.scanActiveFile', () => provider.scanActiveFile()),
+        vscode.commands.registerCommand('daml.scanPeFile', () => provider.scanPeFilePicker())
     );
 }
 
@@ -104,6 +103,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             if (msg.command === 'resolveThreats') this.resolveThreats();
             if (msg.command === 'scanWorkspace') this.scanWorkspace();
             if (msg.command === 'scanActiveFile') this.scanActiveFile();
+            if (msg.command === 'scanPeFile') this.scanPeFilePicker();
         });
 
         this.updateWebview();
@@ -120,13 +120,43 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         const toggleLabel = this.isEnabled ? '$(circle-slash) Disable' : '$(play) Enable';
         const items = [
             { label: '$(graph) Open Dashboard', cmd: 'daml.dashboardView.focus' },
-            { label: '$(shield) Scan Workspace', cmd: 'daml.scanWorkspace' },
+            { label: '$(shield) Scan PE File...', cmd: 'daml.scanPeFile' },
+            { label: '$(shield) Scan Workspace (Build+Scan)', cmd: 'daml.scanWorkspace' },
             { label: '$(file-code) Scan Active File', cmd: 'daml.scanActiveFile' },
             { label: toggleLabel, cmd: 'daml.toggleStatusView' }
         ];
 
         const selection = await vscode.window.showQuickPick(items, { title: 'DAML Control' });
         if (selection) vscode.commands.executeCommand(selection.cmd);
+    }
+
+    public async scanPeFilePicker() {
+        if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
+        if (!this.apiAvailable) {
+            const action = await vscode.window.showWarningMessage(
+                'DAML API server not running. Start it with: uvicorn main:app --host 0.0.0.0 --port 8000',
+                'Retry', 'Cancel'
+            );
+            if (action === 'Retry') {
+                await this.checkApiHealth();
+                if (this.apiAvailable) this.scanPeFilePicker();
+            }
+            return;
+        }
+
+        const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: false,
+            filters: {
+                'PE Files': ['exe', 'dll', 'sys', 'scr', 'ocx'],
+                'All Files': ['*']
+            }
+        });
+        
+        if (uris && uris.length > 0) {
+            await this.scanBinary(uris[0].fsPath, true);
+        }
     }
 
     public async scanWorkspace() {
@@ -194,17 +224,26 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
         
         const editor = vscode.window.activeTextEditor;
-        if (!editor) return vscode.window.showWarningMessage('No active file.');
+        if (!editor) {
+            return this.scanPeFilePicker();
+        }
         
         const sourcePath = editor.document.fileName;
         const ext = path.extname(sourcePath).toLowerCase();
         
-        if (['.exe', '.dll', '.elf'].includes(ext)) {
-            return this.scanBinary(sourcePath);
+        if (['.exe', '.dll', '.sys', '.scr', '.ocx'].includes(ext)) {
+            return this.scanBinary(sourcePath, true);
         }
         
         if (!['.ts', '.js', '.py', '.cpp', '.c', '.rs'].includes(ext)) {
-            return vscode.window.showWarningMessage(`Unsupported: ${ext}. Use .js, .ts, .py, .cpp, .c`);
+            return vscode.window.showWarningMessage(
+                `Unsupported: ${ext}. Use .exe, .dll, .js, .ts, .py, .cpp, .c, or run "Scan PE File..." command`,
+                'Scan PE File...'
+            ).then(sel => {
+                if (sel === 'Scan PE File...') {
+                    vscode.commands.executeCommand('daml.scanPeFile');
+                }
+            });
         }
         
         await this.buildAndScan(sourcePath, true);
@@ -214,7 +253,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
         const fileName = path.basename(sourcePath);
         
-        // Check if binary already exists
         let binaryPath = await this.findExistingBinary(sourcePath, workspaceRoot);
         if (binaryPath) {
             return this.scanBinary(binaryPath, showProgress);
@@ -222,7 +260,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         
         if (!showProgress) return null;
         
-        // Build the project
         const action = await vscode.window.showWarningMessage(
             `No EXE found for ${fileName}. Build now?`,
             'Build & Scan', 'Cancel'
@@ -230,7 +267,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         
         if (action !== 'Build & Scan') return null;
         
-        // Run build with progress
         let builtBinaryPath: string | null = null;
         
         await vscode.window.withProgress(
@@ -239,12 +275,10 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 progress.report({ message: "Starting build..." });
                 
                 try {
-                    // Try to build
                     await this.runBuildCommand(sourcePath, workspaceRoot);
                     
                     progress.report({ message: "Building... waiting for output (this may take 30s-2min)..." });
                     
-                    // Poll for the binary - try for up to 2 minutes
                     for (let i = 0; i < 120; i++) {
                         await new Promise(r => setTimeout(r, 1000));
                         
@@ -262,7 +296,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         );
         
         if (!builtBinaryPath) {
-            // Last resort: find any .exe created in last 5 minutes
             builtBinaryPath = await this.findRecentExeAnywhere(workspaceRoot);
         }
         
@@ -291,17 +324,14 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         const ext = path.extname(sourcePath).toLowerCase();
         
         if (ext === '.js' || ext === '.ts') {
-            // Check if package.json exists
             const pkgPath = path.join(workspaceRoot, 'package.json');
             if (fs.existsSync(pkgPath)) {
                 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
                 
-                // Check for pkg or nexe in dependencies
                 const hasPkg = pkg.devDependencies?.pkg || pkg.dependencies?.pkg;
                 const hasNexe = pkg.devDependencies?.nexe || pkg.dependencies?.nexe;
                 
                 if (hasPkg) {
-                    // Use pkg
                     return new Promise((resolve, reject) => {
                         const child = spawn('npx', ['pkg', '.', '--output', 'dist/app.exe'], {
                             cwd: workspaceRoot,
@@ -329,7 +359,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                         child.on('close', (code) => code === 0 ? resolve() : reject(new Error('nexe failed')));
                     });
                 } else if (pkg.scripts?.build) {
-                    // Run npm run build
                     return new Promise((resolve, reject) => {
                         const child = spawn('npm', ['run', 'build'], {
                             cwd: workspaceRoot,
@@ -340,7 +369,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 }
             }
             
-            // Fallback: try to use pkg directly on the file
             return new Promise((resolve, reject) => {
                 const outDir = path.join(workspaceRoot, 'dist');
                 if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
@@ -364,7 +392,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             });
             
         } else if (ext === '.py') {
-            // PyInstaller
             return new Promise((resolve, reject) => {
                 const child = spawn('pyinstaller', ['--onefile', sourcePath, '--distpath', 'dist'], {
                     cwd: workspaceRoot,
@@ -373,7 +400,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 child.on('close', (code) => code === 0 ? resolve() : reject(new Error('pyinstaller failed')));
             });
         } else if (ext === '.rs') {
-            // Cargo
             return new Promise((resolve, reject) => {
                 const child = spawn('cargo', ['build', '--release'], {
                     cwd: workspaceRoot,
@@ -382,7 +408,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 child.on('close', (code) => code === 0 ? resolve() : reject(new Error('cargo build failed')));
             });
         } else if (['.cpp', '.c'].includes(ext)) {
-            // g++
             return new Promise((resolve, reject) => {
                 const outFile = path.join(workspaceRoot, 'dist', 'app.exe');
                 if (!fs.existsSync(path.dirname(outFile))) {
@@ -404,7 +429,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         const ext = path.extname(sourcePath).toLowerCase();
         const baseName = path.basename(sourcePath, ext);
         
-        // Common output directories and names
         const checkPaths = [
             path.join(workspaceRoot, 'dist', `${baseName}.exe`),
             path.join(workspaceRoot, 'dist', 'app.exe'),
@@ -422,7 +446,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             if (fs.existsSync(p)) return p;
         }
         
-        // Check package.json name
         if (ext === '.js' || ext === '.ts') {
             const pkgPath = path.join(workspaceRoot, 'package.json');
             if (fs.existsSync(pkgPath)) {
@@ -485,7 +508,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     private async scanBinary(binaryPath: string, showProgress: boolean = true): Promise<any> {
         const doScan = async (progress?: vscode.Progress<{ message?: string; increment?: number }>) => {
             try {
-                progress?.report({ message: 'Extracting features...' });
+                progress?.report({ message: 'Extracting EMBER features...' });
                 const features = await this.extractFeatures(binaryPath);
                 
                 progress?.report({ message: 'Analyzing with AI...' });
@@ -514,8 +537,8 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                     }
                 }
                 return result;
-            } catch (err) {
-                if (showProgress) vscode.window.showErrorMessage(`Scan failed: ${err}`);
+            } catch (err: any) {
+                if (showProgress) vscode.window.showErrorMessage(`Scan failed: ${err.message || err}`);
                 throw err;
             }
         };
@@ -542,17 +565,28 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             );
             
             if (stderr && !stderr.includes('DeprecationWarning')) {
-                console.warn('stderr:', stderr);
+                console.warn('Feature extraction stderr:', stderr);
             }
             
             const features = JSON.parse(stdout.trim());
-            if (!Array.isArray(features)) throw new Error('Invalid output');
-            if (features.length !== 2568) throw new Error(`Expected 2568 features, got ${features.length}`);
+            if (!Array.isArray(features)) {
+                throw new Error(`Invalid output: expected array, got ${typeof features}`);
+            }
+            if (features.length !== 2568) {
+                throw new Error(`Expected 2568 EMBER features, got ${features.length}`);
+            }
             
             return features;
         } catch (error: any) {
-            if (error.message?.includes('ModuleNotFoundError')) {
-                throw new Error('Python dependencies missing. Run: pip install lief numpy');
+            if (error.message?.includes('ModuleNotFoundError') || error.stderr?.includes('No module named')) {
+                throw new Error(
+                    'EMBER Python dependencies missing. Run:\n' +
+                    'pip install git+https://github.com/elastic/ember.git\n' +
+                    'pip install lief numpy'
+                );
+            }
+            if (error.message?.includes('Not a valid PE') || error.message?.includes('could not extract')) {
+                throw new Error(`File is not a valid PE executable: ${path.basename(filePath)}`);
             }
             throw new Error(`Feature extraction failed: ${error.message || error}`);
         }
@@ -571,8 +605,8 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             ? `$(shield) DAML ${this.apiAvailable ? '●' : '○'}` 
             : `$(circle-slash) DAML Off`;
         this.statusBarItem.tooltip = this.apiAvailable 
-            ? `API Connected - ${this.threatCount} threats` 
-            : 'API Disconnected';
+            ? `API Connected - ${this.threatCount} threats detected` 
+            : 'API Disconnected - Start with: uvicorn main:app --host 0.0.0.0 --port 8000';
         this.statusBarItem.backgroundColor = (this.isEnabled && this.threatCount > 0) 
             ? new vscode.ThemeColor('statusBarItem.warningBackground') 
             : undefined;
@@ -631,6 +665,10 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             </li>
         `;
 
+        const apiStatusClass = this.apiAvailable ? 'text-green-400' : 'text-red-400';
+        const apiStatusPulse = this.apiAvailable ? '' : 'pulse';
+        const apiStatusText = this.apiAvailable ? '' : '<span class="text-[9px] text-red-400 ml-2">Offline</span>';
+
         return `<!DOCTYPE html>
         <html>
         <head>
@@ -658,9 +696,9 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             <div class="flex flex-col space-y-4 flex-none">
                 <div class="flex justify-between items-center border-b border-[var(--border)] pb-2">
                     <div class="flex items-center gap-2">
-                        <i data-lucide="shield" class="w-4 h-4 ${this.apiAvailable ? 'text-green-400' : 'text-red-400'} ${this.apiAvailable ? '' : 'pulse'}"></i>
+                        <i data-lucide="shield" class="w-4 h-4 ${apiStatusClass} ${apiStatusPulse}"></i>
                         <h1 class="text-xs font-bold uppercase tracking-wider opacity-80">DAML Status</h1>
-                        ${!this.apiAvailable ? '<span class="text-[9px] text-red-400 ml-2">Offline</span>' : ''}
+                        ${apiStatusText}
                     </div>
                     <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded text-[10px] ${this.threatCount === 0 ? 'opacity-50' : ''}" ${this.threatCount === 0 ? 'disabled' : ''}>Clear</button>
                 </div>
@@ -683,6 +721,10 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 <div>
                     <h2 class="text-[10px] font-bold uppercase opacity-60 mb-2">Actions</h2>
                     <div class="grid grid-cols-2 gap-2">
+                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ${!this.apiAvailable ? 'opacity-50' : ''}" onclick="vscode.postMessage({command: 'scanPeFile'})" ${!this.apiAvailable ? 'disabled' : ''}>
+                            <i data-lucide="shield" class="w-4 h-4 text-blue-400"></i>
+                            <span>Scan PE File</span>
+                        </button>
                         <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ${!this.apiAvailable ? 'opacity-50' : ''}" onclick="vscode.postMessage({command: 'scanWorkspace'})" ${!this.apiAvailable ? 'disabled' : ''}>
                             <i data-lucide="folder-search" class="w-4 h-4 text-blue-400"></i>
                             <span>Scan Workspace</span>
@@ -690,6 +732,10 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                         <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ${!this.apiAvailable ? 'opacity-50' : ''}" onclick="vscode.postMessage({command: 'scanActiveFile'})" ${!this.apiAvailable ? 'disabled' : ''}>
                             <i data-lucide="file-search" class="w-4 h-4 text-purple-400"></i>
                             <span>Scan Active File</span>
+                        </button>
+                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer" onclick="vscode.postMessage({command: 'resolveThreats'})">
+                            <i data-lucide="check-circle" class="w-4 h-4 text-green-400"></i>
+                            <span>Clear Threats</span>
                         </button>
                     </div>
                 </div>
@@ -705,7 +751,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
             </div>
 
             <div class="mt-3 flex justify-between items-center text-[9px] opacity-50 border-t border-[var(--border)] pt-2 flex-none">
-                <span>Engine v2.1.4</span>
+                <span>EMBER-LSTM Engine</span>
                 <span><i data-lucide="${this.apiAvailable ? 'check-circle' : 'x-circle'}" class="w-3 h-3 ${this.apiAvailable ? 'text-green-500' : 'text-red-500'} inline"></i> ${this.apiAvailable ? 'Ready' : 'Disconnected'}</span>
             </div>
             
@@ -724,3 +770,5 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         </html>`;
     }
 }
+
+export function deactivate() {}
