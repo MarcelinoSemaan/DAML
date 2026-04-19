@@ -3,35 +3,33 @@ from pydantic import BaseModel
 import torch
 import torch.nn as nn
 import numpy as np
-import math
 from typing import List
-from pathlib import Path  # Add this
+from pathlib import Path
 
 app = FastAPI(title="DAML API")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# MATCH CHECKPOINT: 64 features, 24 timesteps = 1536 total
 N_FEATURES = 64
-N_TIMESTEPS = 40
-PAD_TO = 2560
-N_COLS_RAW = 2568
+N_TIMESTEPS = 24
+EXPECTED_FEATURES = N_TIMESTEPS * N_FEATURES  # 1536
 
-# ── Path Setup (Option B) ─────────────────────────────────────────────────────
-# Get the directory where this main.py file is located (DAML/model/)
+# ── Path Setup ─────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 MODEL_PATH = BASE_DIR / "ember_lstm_best.pt"
 
 print(f"DAML API on {DEVICE}")
 print(f"Looking for model at: {MODEL_PATH.absolute()}")
-print(f"Raw features: {N_COLS_RAW} → pad to {PAD_TO} ({N_TIMESTEPS}×{N_FEATURES})")
+print(f"Model expects: {N_TIMESTEPS}×{N_FEATURES} = {EXPECTED_FEATURES}")
 
-# ── Model (matches your trained model) ────────────────────────────────────────
+# ── Model (matches checkpoint) ───────────────────────────────────────────
 class EmberLSTM(nn.Module):
     def __init__(self, n_features: int, n_timesteps: int):
         super().__init__()
         self.input_proj = nn.Sequential(
-            nn.Linear(n_features, 128),
+            nn.Linear(n_features, 128),  # 64→128
             nn.LayerNorm(128),
             nn.GELU()
         )
@@ -64,30 +62,13 @@ try:
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
     print("✅ Model loaded successfully")
+    print(f"   Input layer: Linear(in={N_FEATURES}, out=128)")
 except Exception as e:
     print(f"❌ Model error: {e}")
-    # Don't raise here - let the API start but return errors for predictions
-    # This allows you to see the error message in the terminal
 
 # ── API Endpoints ─────────────────────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    features: List[float]
-
-@app.get("/health")
-async def health():
-    model_status = "loaded" if MODEL_PATH.exists() else "missing"
-    return {
-        "status": "ok", 
-        "device": str(DEVICE),
-        "model_status": model_status,
-        "model_path": str(MODEL_PATH),
-        "config": {
-            "n_features": N_FEATURES,
-            "n_timesteps": N_TIMESTEPS,
-            "pad_to": PAD_TO,
-            "input_raw": N_COLS_RAW
-        }
-    }
+    features: List[float]  # Now expects exactly 1536 features
 
 @app.post("/predict")
 async def predict(request: PredictRequest):
@@ -95,19 +76,25 @@ async def predict(request: PredictRequest):
         if not MODEL_PATH.exists():
             raise HTTPException(status_code=503, detail=f"Model not found at {MODEL_PATH}")
         
-        if len(request.features) != N_COLS_RAW:
-            raise ValueError(f"Expected {N_COLS_RAW} features, got {len(request.features)}")
+        # Now expects exactly 1536 features (64 × 24)
+        if len(request.features) != EXPECTED_FEATURES:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Expected {EXPECTED_FEATURES} features (64×24), got {len(request.features)}"
+            )
         
-        # Preprocess
+        # Preprocess: reshape to (1, 24, 64)
         x = np.array(request.features, dtype=np.float32)
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        x = x[:PAD_TO]
+        
+        # Reshape for LSTM: (batch=1, timesteps=24, features=64)
         x = x.reshape(1, N_TIMESTEPS, N_FEATURES)
         x = torch.tensor(x).to(DEVICE)
         
         # Inference
         with torch.no_grad():
-            prob = torch.sigmoid(model(x)).item()
+            with torch.amp.autocast('cuda', enabled=DEVICE.type == 'cuda'):
+                prob = torch.sigmoid(model(x)).item()
         
         # Confidence levels
         if prob > 0.9: conf = "critical"
@@ -118,9 +105,13 @@ async def predict(request: PredictRequest):
         return {
             "is_malicious": prob > 0.5,
             "confidence": conf,
-            "malicious_probability": round(prob, 4)
+            "malicious_probability": round(prob, 4),
+            "model_dims": f"{N_TIMESTEPS}×{N_FEATURES}",
+            "note": f"Using {EXPECTED_FEATURES} features (selected 64 per timestep)"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
