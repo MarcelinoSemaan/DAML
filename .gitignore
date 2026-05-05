@@ -1,0 +1,6 @@
+venv_ember/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+*.vsix

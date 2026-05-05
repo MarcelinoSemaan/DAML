@@ -1,0 +1,2 @@
+{"file": "calc.exe", "sha256": "81bd48985fa1753e9e2158a7cf969141edddbd050e976801bb477e24a2a06b2a", "malware_probability": 0.9834, "prediction": "malicious"}
+{"file": "notepad.exe", "sha256": "643a6da238eb90719d8a5fca65ccbd1c7a1cead7f1ae860b68ae008faf887389", "malware_probability": 0.9749, "prediction": "malicious"}
