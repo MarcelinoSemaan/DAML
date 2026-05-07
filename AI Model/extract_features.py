@@ -69,7 +69,9 @@ import torch.nn as nn
 # We stub it out so thrember can import cleanly. Authenticode features will
 # be zeroed for unsigned files, which is the correct behaviour anyway.
 # ─────────────────────────────────────────────────────────────────────────────
+# ── signify stub — MUST be installed before thrember is touched ──────────────
 def _mock_signify():
+    """Inject a minimal signify stub so thrember imports without errors."""
     m_sig  = types.ModuleType("signify")
     m_auth = types.ModuleType("signify.authenticode")
     m_exc  = types.ModuleType("signify.exceptions")
@@ -98,13 +100,21 @@ def _mock_signify():
         sys.modules[name] = mod
 
 
+# 1. Always install stub first so thrember never sees a broken import
+_mock_signify()
+
+# 2. Try to replace stub with real signify only if SignedPEFile actually exists
 try:
-    import signify          # noqa: F401
-    import signify.authenticode  # noqa: F401
+    import importlib
+    for _m in list(sys.modules):          # clear our stubs
+        if _m.startswith("signify"):
+            del sys.modules[_m]
+    import signify.authenticode           # noqa: F401
+    _ = signify.authenticode.SignedPEFile # verify the symbol exists
 except Exception:
-    print("[WARN] signify/oscrypto not available — "
-          "authenticode features will be zero.", file=sys.stderr)
-    _mock_signify()
+    _mock_signify()                       # re-install stub
+    print("[WARN] signify incompatible — authenticode features zeroed.",
+          file=sys.stderr)
 
 from thrember.features import PEFeatureExtractor   # noqa: E402
 

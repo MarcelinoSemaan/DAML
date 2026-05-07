@@ -16,7 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
             datasets: [
                 {
                     label: 'Safe Snippets',
-                    data: [150, 200, 180, 220, 170, 90, 100],
+                    data: [],
                     borderColor: accent,
                     backgroundColor: accent + '22',
                     fill: true,

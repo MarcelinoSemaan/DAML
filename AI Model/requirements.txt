@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+numpy
+torch
+scikit-learn
+git+https://github.com/FutureComputing4AI/EMBER2024.git
+pefile
