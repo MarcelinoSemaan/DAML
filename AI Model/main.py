@@ -131,9 +131,12 @@ def flatten_record(record: dict, prefix: str = "") -> dict:
             out[full_key] = 0.0 if not np.isfinite(val) else val
     return out
 
-with open("artifacts/meta_indices.json") as f:
-    META_INDICES = json.load(f)["indices"]
-    
+try:
+    with open("artifacts/meta_indices.json") as f:
+        META_INDICES = json.load(f)["indices"]
+except:
+    META_INDICES = []
+
 def record_to_features(record: dict, feat_cols: list, scaler):
     """Raw EMBER record dict → (N_TIMESTEPS, TARGET_NF) array."""
     flat = flatten_record(record)
@@ -147,9 +150,8 @@ def record_to_features(record: dict, feat_cols: list, scaler):
             x_raw[idx] = float(val)
 
     # ── FAST FIX: neutralize metadata columns ──
-    # Set missing metadata to training mean so scaler outputs 0 (neutral)
     for idx in META_INDICES:
-        if x_raw[idx] == 0.0:  # Only fix missing/unset metadata
+        if x_raw[idx] == 0.0:
             x_raw[idx] = scaler.mean_[idx]
 
     x_scaled = scaler.transform(x_raw.reshape(1, -1))[0].astype(np.float32)
@@ -167,6 +169,117 @@ def file_to_features(file_path: str, feat_cols: list, scaler):
     return record_to_features(record, feat_cols, scaler)
 
 
+# ── Explainability ──────────────────────────────────────────────────────────
+
+def group_by_prefix(feat_name):
+    """Map EMBER feature name to semantic group."""
+    if feat_name.startswith("byteentropy."):
+        return "byte_entropy"
+    elif feat_name.startswith("histogram."):
+        return "histogram"
+    elif feat_name.startswith("section.") or feat_name.startswith("sections."):
+        return "sections"
+    elif feat_name.startswith("import.") or feat_name.startswith("imports."):
+        return "imports"
+    elif feat_name.startswith("export.") or feat_name.startswith("exports."):
+        return "exports"
+    elif feat_name.startswith("general."):
+        return "general"
+    elif feat_name.startswith("header.") or feat_name.startswith("optional_header."):
+        return "header"
+    elif feat_name.startswith("strings."):
+        return "strings"
+    elif feat_name.startswith("datadirectories."):
+        return "data_directories"
+    elif feat_name.startswith("authenticode.") or feat_name.startswith("signature."):
+        return "authenticode"
+    else:
+        return "other"
+
+
+def compute_attribution(model, tensor, feat_cols, n_cols, n_timesteps):
+    """
+    Compute feature attributions using gradient-based method.
+    Returns top features and group contributions.
+    """
+    baseline = torch.zeros_like(tensor)
+
+    def forward_raw(x):
+        proj = model.input_proj(x)
+        lstm_out, _ = model.lstm(proj)
+        attn_scores = model.attn(lstm_out).squeeze(-1)
+        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)
+        context = (lstm_out * attn_weights).sum(dim=1)
+        return model.classifier(context).squeeze(-1)
+
+    # Simple gradient attribution (faster than IG, good enough for UI)
+    tensor.requires_grad = True
+    output = forward_raw(tensor)
+    prob = float(torch.sigmoid(output).item())
+    output.backward()
+
+    grad_np = tensor.grad[0].cpu().numpy().flatten()[:n_cols]
+    # Convert to native Python floats so Pydantic/JSON can serialize the response
+    attr_np = grad_np.astype(float).tolist()
+    attr_abs = [abs(x) for x in attr_np]
+
+    # Top 15 features
+    top_k = 15
+    top_idx = np.argsort(attr_abs)[-top_k:][::-1]
+    top_features = []
+    for rank, idx in enumerate(top_idx, 1):
+        feat = feat_cols[idx]
+        val = attr_abs[idx]
+        signed = attr_np[idx]
+        direction = "malicious" if signed > 0 else "benign"
+        top_features.append({
+            "rank": rank,
+            "feature": feat,
+            "group": group_by_prefix(feat),
+            "attribution": val,
+            "direction": direction,
+            "raw_value": signed
+        })
+
+    # Group contributions
+    group_scores = {}
+    group_directional = {}
+    for i, feat in enumerate(feat_cols):
+        g = group_by_prefix(feat)
+        group_scores[g] = group_scores.get(g, 0.0) + attr_abs[i]
+        group_directional[g] = group_directional.get(g, 0.0) + attr_np[i]
+
+    total = sum(group_scores.values())
+    groups = []
+    for g, score in sorted(group_scores.items(), key=lambda x: -x[1]):
+        pct = score / total * 100 if total > 0 else 0.0
+        net_dir = group_directional[g]
+        groups.append({
+            "group": g,
+            "percentage": round(pct, 1),
+            "direction": "malicious" if net_dir > 0 else "benign",
+            "score": score
+        })
+
+    # Benign pushers: features with negative attribution (push toward benign)
+    benign_pushers = []
+    for i, feat in enumerate(feat_cols):
+        if attr_np[i] < -0.001:
+            benign_pushers.append({
+                "feature": feat,
+                "attribution": attr_np[i],
+                "group": group_by_prefix(feat)
+            })
+    benign_pushers.sort(key=lambda x: x["attribution"])
+    benign_pushers = benign_pushers[:10]
+
+    return {
+        "probability": prob,
+        "prediction": "MALICIOUS" if prob >= 0.5 else "BENIGN",
+        "top_features": top_features,
+        "groups": groups,
+        "benign_pushers": benign_pushers
+    }
 # ── Lifespan / Startup ──────────────────────────────────────────────────────
 class State:
     def __init__(self):
@@ -237,6 +350,13 @@ class PredictResponse(BaseModel):
     is_malicious: bool
     confidence: str
     malicious_probability: float
+
+
+class ExplainResponse(BaseModel):
+    probability: float
+    prediction: str
+    top_features: list[dict]
+    groups: list[dict]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -328,27 +448,20 @@ def predict_path(req: PredictPathRequest):
                 data = json.load(f)
 
             if isinstance(data, list):
-                # Format 1: flat pre-scaled feature vector
                 arr = np.array(data, dtype=np.float32)
                 tensor = _prepare_array(arr)
-
             elif isinstance(data, dict) and "features" in data:
-                # Format 2: {"features": [...]}
                 arr = np.array(data["features"], dtype=np.float32)
                 tensor = _prepare_array(arr)
-
             elif isinstance(data, dict):
-                # Format 3: raw thrember/EMBER record (your sample)
                 features_arr = record_to_features(data, state.feat_cols, state.scaler)
                 tensor = torch.tensor(features_arr, dtype=torch.float32).unsqueeze(0).to(state.device)
-
             else:
                 raise HTTPException(
                     status_code=400,
                     detail="JSON must be a feature array, {features: [...]}, or a raw EMBER record",
                 )
         else:
-            # Binary file: extract EMBER features directly from PE/binary bytes
             features_arr = file_to_features(str(path), state.feat_cols, state.scaler)
             tensor = torch.tensor(features_arr, dtype=torch.float32).unsqueeze(0).to(state.device)
 
@@ -360,6 +473,50 @@ def predict_path(req: PredictPathRequest):
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 
+@app.post("/explain", response_model=ExplainResponse)
+def explain(req: PredictPathRequest):
+    """Explain why a file was classified as malicious or benign."""
+    if state.model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    path = Path(req.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {req.file_path}")
+
+    try:
+        if path.suffix.lower() == ".json":
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if isinstance(data, list):
+                arr = np.array(data, dtype=np.float32)
+                x_scaled = state.scaler.transform(arr.reshape(1, -1))[0].astype(np.float32)
+                pad_to = state.n_timesteps * TARGET_NF
+                if len(x_scaled) < pad_to:
+                    x_scaled = np.pad(x_scaled, (0, pad_to - len(x_scaled)), constant_values=0.0)
+                features_arr = x_scaled.reshape(state.n_timesteps, TARGET_NF)
+            elif isinstance(data, dict) and "features" not in data:
+                features_arr = record_to_features(data, state.feat_cols, state.scaler)
+            elif isinstance(data, dict) and "features" in data:
+                arr = np.array(data["features"], dtype=np.float32)
+                x_scaled = state.scaler.transform(arr.reshape(1, -1))[0].astype(np.float32)
+                pad_to = state.n_timesteps * TARGET_NF
+                if len(x_scaled) < pad_to:
+                    x_scaled = np.pad(x_scaled, (0, pad_to - len(x_scaled)), constant_values=0.0)
+                features_arr = x_scaled.reshape(state.n_timesteps, TARGET_NF)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="JSON must be a feature array, {features: [...]}, or a raw EMBER record",
+                )
+        else:
+            features_arr = file_to_features(str(path), state.feat_cols, state.scaler)
+
+        tensor = torch.tensor(features_arr, dtype=torch.float32).unsqueeze(0).to(state.device)
+        return compute_attribution(state.model, tensor, state.feat_cols, state.n_cols, state.n_timesteps)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Explanation failed: {str(e)}")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -7,6 +7,45 @@ import { promisify } from 'util';
 
 const execPromise = promisify(exec);
 
+// ── Compiler Configuration Types ───────────────────────────────────────────
+
+type CompilerMode = 'windows-native' | 'linux-cross' | 'custom';
+
+type CompilerConfig = {
+    mode: CompilerMode;
+    cCompiler: string;
+    cppCompiler: string;
+    rustTarget: string;
+    customPath?: string;
+    extraFlags: string[];
+};
+
+const DEFAULT_COMPILERS: Record<CompilerMode, CompilerConfig> = {
+    'windows-native': {
+        mode: 'windows-native',
+        cCompiler: 'gcc',
+        cppCompiler: 'g++',
+        rustTarget: 'x86_64-pc-windows-msvc',
+        extraFlags: []
+    },
+    'linux-cross': {
+        mode: 'linux-cross',
+        cCompiler: 'x86_64-w64-mingw32-gcc',
+        cppCompiler: 'x86_64-w64-mingw32-g++',
+        rustTarget: 'x86_64-pc-windows-gnu',
+        extraFlags: ['-static-libgcc', '-static-libstdc++']
+    },
+    'custom': {
+        mode: 'custom',
+        cCompiler: 'gcc',
+        cppCompiler: 'g++',
+        rustTarget: 'x86_64-pc-windows-msvc',
+        extraFlags: []
+    }
+};
+
+// ── Activation ─────────────────────────────────────────────────────────────
+
 export function activate(context: vscode.ExtensionContext) {
     const provider = new DamlDashboardProvider(context);
 
@@ -17,9 +56,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('daml.scanWorkspace', () => provider.scanWorkspace()),
         vscode.commands.registerCommand('daml.scanActiveFile', () => provider.scanActiveFile()),
         vscode.commands.registerCommand('daml.scanPeFile', () => provider.scanPeFilePicker()),
-        vscode.commands.registerCommand('daml.scanJsonClipboard', () => provider.scanJsonClipboard())
+        vscode.commands.registerCommand('daml.scanJsonClipboard', () => provider.scanJsonClipboard()),
+        vscode.commands.registerCommand('daml.selectCompiler', () => provider.selectCompiler()),
+        vscode.commands.registerCommand('daml.forceRebuild', () => provider.forceRebuildActiveFile())
     );
 }
+
+// ── Dashboard Provider ─────────────────────────────────────────────────────
 
 class DamlDashboardProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -27,11 +70,17 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     private threatCount: number = 0;
     private isEnabled: boolean = true;
     private recentDetections: Array<{ file: string; severity: string; time: string; prob: number }> = [];
+    private lastExplanation: any = null;
     private rollingHistory: number[] = new Array(12).fill(0);
     private apiAvailable: boolean = false;
+    private compilerConfig: CompilerConfig;
 
     constructor(private context: vscode.ExtensionContext) {
         this.rollingHistory = this.context.globalState.get<number[]>('daml.rollingHistory', new Array(12).fill(0));
+        
+        const savedConfig = this.context.globalState.get<CompilerConfig>('daml.compilerConfig');
+        this.compilerConfig = savedConfig || DEFAULT_COMPILERS['windows-native'];
+        
         this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
         this.statusBarItem.command = 'daml.showMenu';
         this.updateStatusBar();
@@ -41,6 +90,127 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         setInterval(() => this.checkApiHealth(), 5000);
         setInterval(() => this.shiftRollingWindow(), 300000);
     }
+
+    // ── Compiler Selection ─────────────────────────────────────────────────
+
+    public async selectCompiler() {
+        const modes: { label: string; description: string; mode: CompilerMode }[] = [
+            {
+                label: '$(window) Windows Native',
+                description: 'Use installed MinGW/GCC on Windows (gcc/g++)',
+                mode: 'windows-native'
+            },
+            {
+                label: '$(terminal-linux) Linux Cross-Compile',
+                description: 'Use MinGW-w64 cross-compiler (x86_64-w64-mingw32-gcc)',
+                mode: 'linux-cross'
+            },
+            {
+                label: '$(gear) Custom',
+                description: 'Specify your own compiler paths and flags',
+                mode: 'custom'
+            }
+        ];
+
+        const currentMode = this.compilerConfig.mode;
+        const items = modes.map(m => ({
+            ...m,
+            description: m.mode === currentMode ? `${m.description} (current)` : m.description,
+            picked: m.mode === currentMode
+        }));
+
+        const selection = await vscode.window.showQuickPick(items, {
+            title: 'Select Compiler Mode',
+            placeHolder: `Current: ${currentMode}`
+        });
+
+        if (!selection) return;
+
+        if (selection.mode === 'custom') {
+            await this.configureCustomCompiler();
+        } else {
+            this.compilerConfig = DEFAULT_COMPILERS[selection.mode];
+            await this.context.globalState.update('daml.compilerConfig', this.compilerConfig);
+            vscode.window.showInformationMessage(`Compiler set to: ${selection.label.split(' ').slice(1).join(' ')}`);
+        }
+        
+        this.updateStatusBar();
+    }
+
+    private async configureCustomCompiler() {
+        const cCompiler = await vscode.window.showInputBox({
+            prompt: 'C compiler command (e.g., gcc, clang, x86_64-w64-mingw32-gcc)',
+            value: this.compilerConfig.cCompiler || 'gcc'
+        });
+        if (!cCompiler) return;
+
+        const cppCompiler = await vscode.window.showInputBox({
+            prompt: 'C++ compiler command (e.g., g++, clang++, x86_64-w64-mingw32-g++)',
+            value: this.compilerConfig.cppCompiler || 'g++'
+        });
+        if (!cppCompiler) return;
+
+        const rustTarget = await vscode.window.showInputBox({
+            prompt: 'Rust target triple (e.g., x86_64-pc-windows-msvc)',
+            value: this.compilerConfig.rustTarget || 'x86_64-pc-windows-msvc'
+        });
+        if (!rustTarget) return;
+
+        const extraFlags = await vscode.window.showInputBox({
+            prompt: 'Extra compiler flags (space-separated, optional)',
+            value: this.compilerConfig.extraFlags.join(' ')
+        });
+
+        this.compilerConfig = {
+            mode: 'custom',
+            cCompiler,
+            cppCompiler,
+            rustTarget,
+            extraFlags: extraFlags ? extraFlags.split(/\s+/) : [],
+            customPath: undefined
+        };
+
+        await this.context.globalState.update('daml.compilerConfig', this.compilerConfig);
+        vscode.window.showInformationMessage(`Custom compiler configured: ${cCompiler} / ${cppCompiler}`);
+    }
+
+    private async verifyCompiler(cmd: string): Promise<boolean> {
+        try {
+            await execPromise(`${cmd} --version`, { timeout: 5000 });
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private async getAvailableCompiler(sourcePath: string): Promise<{ cmd: string; isCross: boolean } | null> {
+        const ext = path.extname(sourcePath).toLowerCase();
+        const isCpp = ext === '.cpp';
+        
+        let preferredCmd = isCpp ? this.compilerConfig.cppCompiler : this.compilerConfig.cCompiler;
+        const isCross = this.compilerConfig.mode === 'linux-cross';
+
+        if (await this.verifyCompiler(preferredCmd)) {
+            return { cmd: preferredCmd, isCross };
+        }
+
+        const fallbacks = isCpp 
+            ? ['g++', 'clang++', 'x86_64-w64-mingw32-g++', 'c++']
+            : ['gcc', 'clang', 'x86_64-w64-mingw32-gcc', 'cc'];
+
+        for (const cmd of fallbacks) {
+            if (await this.verifyCompiler(cmd)) {
+                vscode.window.showWarningMessage(
+                    `Preferred compiler ${preferredCmd} not found. Using fallback: ${cmd}`
+                );
+                return { cmd, isCross: cmd.includes('mingw32') };
+            }
+        }
+
+        return null;
+    }
+
+    // ── API Health ─────────────────────────────────────────────────────────
 
     private async checkApiHealth(): Promise<void> {
         try {
@@ -96,6 +266,12 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    private async apiExplain(filePath: string): Promise<any> {
+        return this.apiRequest('/explain', 'POST', { file_path: filePath });
+    }
+
+    // ── Webview ──────────────────────────────────────────────────────────
+
     public resolveWebviewView(webviewView: vscode.WebviewView) {
         this._view = webviewView;
         webviewView.webview.options = {
@@ -121,20 +297,28 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         this.updateWebview();
     }
 
+    // ── Quick Pick Menu ────────────────────────────────────────────────────
+
     public async showQuickPickMenu() {
         const toggleLabel = this.isEnabled ? '$(circle-slash) Disable' : '$(play) Enable';
+        const compilerLabel = `$(tools) Compiler: ${this.compilerConfig.mode}`;
+        
         const items = [
             { label: '$(graph) Open Dashboard', cmd: 'daml.dashboardView.focus' },
             { label: '$(shield) Scan PE File...', cmd: 'daml.scanPeFile' },
             { label: '$(file-json) Scan JSON from Clipboard', cmd: 'daml.scanJsonClipboard' },
             { label: '$(shield) Scan Workspace (Build+Scan)', cmd: 'daml.scanWorkspace' },
             { label: '$(file-code) Scan Active File', cmd: 'daml.scanActiveFile' },
+            { label: '$(refresh) Force Rebuild Active File', cmd: 'daml.forceRebuild' },
+            { label: compilerLabel, cmd: 'daml.selectCompiler' },
             { label: toggleLabel, cmd: 'daml.toggleStatusView' }
         ];
 
         const selection = await vscode.window.showQuickPick(items, { title: 'DAML Control' });
         if (selection) vscode.commands.executeCommand(selection.cmd);
     }
+
+    // ── Scan Commands ──────────────────────────────────────────────────────
 
     public async scanPeFilePicker() {
         if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
@@ -271,6 +455,12 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         await this.buildAndScan(sourcePath, true);
     }
 
+
+
+    public async forceRebuildActiveFile() {
+        await this.scanActiveFile();
+    }
+
     public async scanJsonClipboard() {
         if (!this.isEnabled) {
             return vscode.window.showWarningMessage('Enable DAML first.');
@@ -318,7 +508,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                         });
                         this.recentDetections = this.recentDetections.slice(0, 10);
                         this.updateStatusBar();
-                        this.updateWebview();
 
                         vscode.window.showWarningMessage(
                             `⚠️ Threat detected in clipboard JSON! (${(result.malicious_probability * 100).toFixed(0)}% confidence)`
@@ -328,6 +517,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                             `✅ Clipboard JSON safe (${(result.malicious_probability * 100).toFixed(1)}% risk)`
                         );
                     }
+                    this.updateWebview();
                     return result;
                 } catch (err: any) {
                     vscode.window.showErrorMessage(`Scan failed: ${err.message || err}`);
@@ -337,264 +527,275 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         );
     }
 
+    // ── Build & Scan ───────────────────────────────────────────────────────
+
     private async buildAndScan(sourcePath: string, showProgress: boolean): Promise<any | null> {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
         const fileName = path.basename(sourcePath);
-
-        let binaryPath = await this.findExistingBinary(sourcePath, workspaceRoot);
-        if (binaryPath) {
-            return this.scanBinary(binaryPath, showProgress);
-        }
+        const ext = path.extname(sourcePath).toLowerCase();
+        const baseName = path.basename(sourcePath, ext);
+        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
 
         if (!showProgress) return null;
 
-        const action = await vscode.window.showWarningMessage(`No EXE found for ${fileName}. Build now?`, 'Build & Scan', 'Cancel');
-
+        // Always build — simple and predictable
+        const action = await vscode.window.showWarningMessage(
+            `Build ${fileName} into EXE and scan?`, 
+            'Build & Scan', 
+            'Cancel'
+        );
         if (action !== 'Build & Scan') return null;
 
-        let builtBinaryPath: string | null = null;
-
         await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: 'Building project...', cancellable: false },
+            { location: vscode.ProgressLocation.Notification, title: `Building ${fileName}...`, cancellable: false },
             async (progress) => {
-                progress.report({ message: 'Starting build...' });
-
+                progress.report({ message: 'Compiling...' });
                 try {
                     await this.runBuildCommand(sourcePath, workspaceRoot);
-
-                    progress.report({ message: 'Building... waiting for output (this may take 30s-2min)...' });
-
-                    for (let i = 0; i < 120; i++) {
-                        await new Promise((r) => setTimeout(r, 1000));
-
-                        builtBinaryPath = await this.findExistingBinary(sourcePath, workspaceRoot);
-                        if (builtBinaryPath) break;
-
-                        if (i % 5 === 0) {
-                            progress.report({ message: `Still building... (${i}s)` });
-                        }
-                    }
                 } catch (err: any) {
-                    vscode.window.showErrorMessage(`Build failed: ${err}`);
+                    vscode.window.showErrorMessage(`Build failed: ${err.message || err}`);
+                    throw err;
                 }
             }
         );
 
-        if (!builtBinaryPath) {
-            builtBinaryPath = await this.findRecentExeAnywhere(workspaceRoot);
-        }
-
-        if (!builtBinaryPath || !fs.existsSync(builtBinaryPath)) {
-            vscode.window
-                .showErrorMessage('Build completed but no .exe found. Check your build output in dist/ or build/ folders.', 'Open Folder')
-                .then((sel) => {
-                    if (sel === 'Open Folder') {
-                        const distPath = path.join(workspaceRoot, 'dist');
-                        if (fs.existsSync(distPath)) {
-                            vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(distPath));
-                        } else {
-                            vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(workspaceRoot));
-                        }
-                    }
-                });
+        if (!fs.existsSync(outFile)) {
+            vscode.window.showErrorMessage(`No .exe produced. Expected: dist/${baseName}.exe`);
             return null;
         }
 
-        vscode.window.showInformationMessage(`Build complete! Found: ${path.basename(builtBinaryPath)}`);
-        return this.scanBinary(builtBinaryPath, showProgress);
+        return this.scanBinary(outFile, showProgress);
     }
+
+    // ── Build Commands (with compiler selection) ─────────────────────────
 
     private async runBuildCommand(sourcePath: string, workspaceRoot: string): Promise<void> {
         const ext = path.extname(sourcePath).toLowerCase();
 
         if (ext === '.js' || ext === '.ts') {
-            const pkgPath = path.join(workspaceRoot, 'package.json');
-            if (fs.existsSync(pkgPath)) {
-                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-
-                const hasPkg = pkg.devDependencies?.pkg || pkg.dependencies?.pkg;
-                const hasNexe = pkg.devDependencies?.nexe || pkg.dependencies?.nexe;
-
-                if (hasPkg) {
-                    return new Promise((resolve, reject) => {
-                        const child = spawn('npx', ['pkg', '.', '--output', 'dist/app.exe'], {
-                            cwd: workspaceRoot,
-                            shell: true,
-                            stdio: 'pipe'
-                        });
-
-                        let errorOutput = '';
-                        child.stderr.on('data', (data: Buffer) => {
-                            errorOutput += data;
-                        });
-
-                        child.on('close', (code: number | null) => {
-                            if (code === 0 || fs.existsSync(path.join(workspaceRoot, 'dist', 'app.exe'))) {
-                                resolve();
-                            } else {
-                                reject(new Error(`pkg failed: ${errorOutput}`));
-                            }
-                        });
-                    });
-                } else if (hasNexe) {
-                    return new Promise((resolve, reject) => {
-                        const child = spawn('npx', ['nexe', sourcePath, '-o', 'dist/app.exe'], {
-                            cwd: workspaceRoot,
-                            shell: true
-                        });
-                        child.on('close', (code: number | null) => (code === 0 ? resolve() : reject(new Error('nexe failed'))));
-                    });
-                } else if (pkg.scripts?.build) {
-                    return new Promise((resolve, reject) => {
-                        const child = spawn('npm', ['run', 'build'], {
-                            cwd: workspaceRoot,
-                            shell: true
-                        });
-                        child.on('close', (code: number | null) => (code === 0 ? resolve() : reject(new Error('npm build failed'))));
-                    });
-                }
-            }
-
-            return new Promise((resolve, reject) => {
-                const outDir = path.join(workspaceRoot, 'dist');
-                if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-
-                const child = spawn('npx', ['pkg', sourcePath, '--target', 'node18-win-x64', '--output', 'dist/app.exe'], {
-                    cwd: workspaceRoot,
-                    shell: true,
-                    stdio: 'pipe'
-                });
-
-                let errorOutput = '';
-                child.stderr.on('data', (data: Buffer) => {
-                    errorOutput += data;
-                });
-
-                child.on('close', (code: number | null) => {
-                    if (code === 0 || fs.existsSync(path.join(workspaceRoot, 'dist', 'app.exe'))) {
-                        resolve();
-                    } else {
-                        reject(new Error(`pkg failed. Try installing it: npm install -g pkg\n${errorOutput}`));
-                    }
-                });
-            });
+            return this.runJsBuild(sourcePath, workspaceRoot);
         } else if (ext === '.py') {
-            return new Promise((resolve, reject) => {
-                const child = spawn('pyinstaller', ['--onefile', sourcePath, '--distpath', 'dist'], {
-                    cwd: workspaceRoot,
-                    shell: true
-                });
-                child.on('close', (code: number | null) => (code === 0 ? resolve() : reject(new Error('pyinstaller failed'))));
-            });
+            return this.runPythonBuild(sourcePath, workspaceRoot);
         } else if (ext === '.rs') {
-            return new Promise((resolve, reject) => {
-                const child = spawn('cargo', ['build', '--release'], {
-                    cwd: workspaceRoot,
-                    shell: true
-                });
-                child.on('close', (code: number | null) => (code === 0 ? resolve() : reject(new Error('cargo build failed'))));
-            });
+            return this.runRustBuild(sourcePath, workspaceRoot);
         } else if (['.cpp', '.c'].includes(ext)) {
-            return new Promise((resolve, reject) => {
-                const outFile = path.join(workspaceRoot, 'dist', 'app.exe');
-                if (!fs.existsSync(path.dirname(outFile))) {
-                    fs.mkdirSync(path.dirname(outFile), { recursive: true });
-                }
-
-                const child = spawn('g++', [sourcePath, '-o', outFile], {
-                    cwd: workspaceRoot,
-                    shell: true
-                });
-                child.on('close', (code: number | null) => (code === 0 ? resolve() : reject(new Error('g++ failed'))));
-            });
+            return this.runCppBuild(sourcePath, workspaceRoot);
         }
 
         throw new Error(`No build command for ${ext}`);
     }
 
-    private async findExistingBinary(sourcePath: string, workspaceRoot: string): Promise<string | null> {
+    private async runCppBuild(sourcePath: string, workspaceRoot: string): Promise<void> {
+        const compiler = await this.getAvailableCompiler(sourcePath);
+        if (!compiler) {
+            throw new Error('No compiler available');
+        }
+
         const ext = path.extname(sourcePath).toLowerCase();
         const baseName = path.basename(sourcePath, ext);
+        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
 
-        const checkPaths = [
-            path.join(workspaceRoot, 'dist', `${baseName}.exe`),
-            path.join(workspaceRoot, 'dist', 'app.exe'),
-            path.join(workspaceRoot, 'dist', 'index.exe'),
-            path.join(workspaceRoot, 'dist', 'main.exe'),
-            path.join(workspaceRoot, 'build', `${baseName}.exe`),
-            path.join(workspaceRoot, 'build', 'app.exe'),
-            path.join(workspaceRoot, `${baseName}.exe`),
-            path.join(workspaceRoot, 'target', 'release', `${baseName}.exe`),
-            path.join(workspaceRoot, 'target', 'release', 'app.exe'),
-            path.join(workspaceRoot, 'target', 'debug', `${baseName}.exe`)
-        ];
-
-        for (const p of checkPaths) {
-            if (fs.existsSync(p)) return p;
+        if (!fs.existsSync(path.dirname(outFile))) {
+            fs.mkdirSync(path.dirname(outFile), { recursive: true });
         }
 
-        if (ext === '.js' || ext === '.ts') {
-            const pkgPath = path.join(workspaceRoot, 'package.json');
-            if (fs.existsSync(pkgPath)) {
-                try {
-                    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-                    if (pkg.name) {
-                        const nameExe = path.join(workspaceRoot, 'dist', `${pkg.name}.exe`);
-                        if (fs.existsSync(nameExe)) return nameExe;
-                    }
-                    if (pkg.bin) {
-                        const binName = Object.keys(pkg.bin)[0];
-                        if (binName) {
-                            const binExe = path.join(workspaceRoot, 'dist', `${binName}.exe`);
-                            if (fs.existsSync(binExe)) return binExe;
-                        }
-                    }
-                } catch (e: any) {
-                    // ignore
-                }
+        const flags = ['-O2', '-Wall', ...this.compilerConfig.extraFlags];
+
+        if (compiler.isCross || this.compilerConfig.mode === 'linux-cross') {
+            flags.push('-static-libgcc');
+            if (ext === '.cpp') {
+                flags.push('-static-libstdc++');
             }
         }
 
-        return null;
+        return new Promise((resolve, reject) => {
+            const args = [sourcePath, ...flags, '-o', outFile];
+            const child = spawn(compiler.cmd, args, {
+                cwd: workspaceRoot,
+                shell: true,
+                stdio: 'pipe'
+            });
+
+            let errorOutput = '';
+            child.stderr.on('data', (data: Buffer) => {
+                errorOutput += data.toString();
+            });
+
+            child.on('close', (code: number | null) => {
+                if (code === 0 && fs.existsSync(outFile)) {
+                    resolve();
+                } else {
+                    reject(new Error(`${compiler.cmd} failed (code ${code}):\n${errorOutput}`));
+                }
+            });
+        });
     }
 
-    private async findRecentExeAnywhere(workspaceRoot: string): Promise<string | null> {
-        const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
-
-        const searchDirs = [
-            path.join(workspaceRoot, 'dist'),
-            path.join(workspaceRoot, 'build'),
-            path.join(workspaceRoot, 'target', 'release'),
-            path.join(workspaceRoot, 'target', 'debug'),
-            path.join(workspaceRoot, 'bin'),
-            workspaceRoot
-        ];
-
-        let newestExe: string | null = null;
-        let newestTime = 0;
-
-        for (const dir of searchDirs) {
-            if (!fs.existsSync(dir)) continue;
-
-            try {
-                const files = fs.readdirSync(dir);
-                for (const file of files) {
-                    if (file.endsWith('.exe')) {
-                        const fullPath = path.join(dir, file);
-                        const stats = fs.statSync(fullPath);
-                        if (stats.mtimeMs > fiveMinutesAgo && stats.mtimeMs > newestTime) {
-                            newestTime = stats.mtimeMs;
-                            newestExe = fullPath;
+    private async runRustBuild(sourcePath: string, workspaceRoot: string): Promise<void> {
+        const target = this.compilerConfig.rustTarget;
+        
+        try {
+            const { stdout } = await execPromise('rustup target list --installed');
+            if (!stdout.includes(target)) {
+                const install = await vscode.window.showWarningMessage(
+                    `Rust target ${target} not installed. Install now?`,
+                    'Yes',
+                    'No'
+                );
+                if (install === 'Yes') {
+                    await vscode.window.withProgress(
+                        { location: vscode.ProgressLocation.Notification, title: `Installing Rust target ${target}...` },
+                        async () => {
+                            await execPromise(`rustup target add ${target}`);
                         }
-                    }
+                    );
                 }
-            } catch (e: any) {
-                // ignore
+            }
+        } catch {
+            // rustup not available, try anyway
+        }
+
+        return new Promise((resolve, reject) => {
+            const args = ['build', '--release', '--target', target];
+            const child = spawn('cargo', args, {
+                cwd: workspaceRoot,
+                shell: true,
+                stdio: 'pipe'
+            });
+
+            let errorOutput = '';
+            child.stderr.on('data', (data: Buffer) => {
+                errorOutput += data.toString();
+            });
+
+            child.on('close', (code: number | null) => {
+                if (code === 0) {
+                    resolve();
+                } else {
+                    reject(new Error(`cargo build failed (target: ${target}):\n${errorOutput}`));
+                }
+            });
+        });
+    }
+
+    private async runJsBuild(sourcePath: string, workspaceRoot: string): Promise<void> {
+        const pkgPath = path.join(workspaceRoot, 'package.json');
+        const ext = path.extname(sourcePath).toLowerCase();
+        const baseName = path.basename(sourcePath, ext);
+        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
+
+        if (!fs.existsSync(path.dirname(outFile))) {
+            fs.mkdirSync(path.dirname(outFile), { recursive: true });
+        }
+
+        if (fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+
+            const hasPkg = pkg.devDependencies?.pkg || pkg.dependencies?.pkg;
+            const hasNexe = pkg.devDependencies?.nexe || pkg.dependencies?.nexe;
+
+            if (hasPkg) {
+                return new Promise((resolve, reject) => {
+                    const child = spawn('npx', ['pkg', '.', '--output', outFile], {
+                        cwd: workspaceRoot,
+                        shell: true,
+                        stdio: 'pipe'
+                    });
+
+                    let errorOutput = '';
+                    child.stderr.on('data', (data: Buffer) => {
+                        errorOutput += data;
+                    });
+
+                    child.on('close', (code: number | null) => {
+                        if (code === 0 && fs.existsSync(outFile)) {
+                            resolve();
+                        } else {
+                            reject(new Error(`pkg failed: ${errorOutput}`));
+                        }
+                    });
+                });
+            } else if (hasNexe) {
+                return new Promise((resolve, reject) => {
+                    const child = spawn('npx', ['nexe', sourcePath, '-o', outFile], {
+                        cwd: workspaceRoot,
+                        shell: true
+                    });
+                    child.on('close', (code: number | null) => {
+                        if (code === 0 && fs.existsSync(outFile)) {
+                            resolve();
+                        } else {
+                            reject(new Error('nexe failed'));
+                        }
+                    });
+                });
+            } else if (pkg.scripts?.build) {
+                return new Promise((resolve, reject) => {
+                    const child = spawn('npm', ['run', 'build'], {
+                        cwd: workspaceRoot,
+                        shell: true
+                    });
+                    child.on('close', (code: number | null) => (code === 0 ? resolve() : reject(new Error('npm build failed'))));
+                });
             }
         }
 
-        return newestExe;
+        return new Promise((resolve, reject) => {
+            const child = spawn('npx', ['pkg', sourcePath, '--target', 'node18-win-x64', '--output', outFile], {
+                cwd: workspaceRoot,
+                shell: true,
+                stdio: 'pipe'
+            });
+
+            let errorOutput = '';
+            child.stderr.on('data', (data: Buffer) => {
+                errorOutput += data;
+            });
+
+            child.on('close', (code: number | null) => {
+                if (code === 0 && fs.existsSync(outFile)) {
+                    resolve();
+                } else {
+                    reject(new Error(`pkg failed. Try installing it: npm install -g pkg\n${errorOutput}`));
+                }
+            });
+        });
     }
+
+    private async runPythonBuild(sourcePath: string, workspaceRoot: string): Promise<void> {
+        const ext = path.extname(sourcePath).toLowerCase();
+        const baseName = path.basename(sourcePath, ext);
+        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
+
+        if (!fs.existsSync(path.dirname(outFile))) {
+            fs.mkdirSync(path.dirname(outFile), { recursive: true });
+        }
+
+        return new Promise((resolve, reject) => {
+            const child = spawn('pyinstaller', ['--onefile', sourcePath, '--distpath', 'dist', '-n', baseName], {
+                cwd: workspaceRoot,
+                shell: true
+            });
+            child.on('close', (code: number | null) => {
+                if (code === 0 && fs.existsSync(outFile)) {
+                    resolve();
+                } else {
+                    reject(new Error('pyinstaller failed'));
+                }
+            });
+        });
+    }
+
+    // ── Binary Discovery ───────────────────────────────────────────────────
+
+    private async findBinary(sourcePath: string, workspaceRoot: string): Promise<string | null> {
+        const ext = path.extname(sourcePath).toLowerCase();
+        const baseName = path.basename(sourcePath, ext);
+        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
+        return fs.existsSync(outFile) ? outFile : null;
+    }
+
+    // ── Scanning ───────────────────────────────────────────────────────────
 
     private async scanBinary(binaryPath: string, showProgress: boolean = true): Promise<any> {
         const doScan = async (progress?: vscode.Progress<{ message?: string; increment?: number }>) => {
@@ -602,6 +803,14 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 progress?.report({ message: 'Sending to DAML API...' });
                 
                 const result = await this.apiRequest('/predict_path', 'POST', { file_path: binaryPath });
+
+                // Fetch explanation
+                try {
+                    this.lastExplanation = await this.apiRequest('/explain', 'POST', { file_path: binaryPath });
+                } catch (e: any) {
+                    this.lastExplanation = { error: true, message: e.message || 'Explain failed' };
+                }
+
 
                 if (result.is_malicious) {
                     this.threatCount++;
@@ -614,7 +823,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                     });
                     this.recentDetections = this.recentDetections.slice(0, 10);
                     this.updateStatusBar();
-                    this.updateWebview();
 
                     vscode.window.showWarningMessage(
                         `⚠️ Threat in ${path.basename(binaryPath)}! (${(result.malicious_probability * 100).toFixed(0)}% confidence)`
@@ -626,6 +834,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                         );
                     }
                 }
+                this.updateWebview();
                 return result;
             } catch (err: any) {
                 if (showProgress) vscode.window.showErrorMessage(`Scan failed: ${err.message || err}`);
@@ -682,6 +891,8 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    // ── State Management ─────────────────────────────────────────────────────
+
     private recordDetection() {
         this.rollingHistory[this.rollingHistory.length - 1]++;
         this.context.globalState.update('daml.rollingHistory', this.rollingHistory);
@@ -711,13 +922,20 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         vscode.window.showInformationMessage('DAML: Activity graph reset.');
     }
 
+    // ── UI Updates ───────────────────────────────────────────────────────────
+
     private updateStatusBar() {
+        const compilerIndicator = this.compilerConfig.mode === 'linux-cross' ? '[WSL]' : 
+                                  this.compilerConfig.mode === 'custom' ? '[Custom]' : '';
+        
         this.statusBarItem.text = this.isEnabled
-            ? `$(shield) DAML ${this.apiAvailable ? '●' : '○'}`
+            ? `$(shield) DAML ${compilerIndicator} ${this.apiAvailable ? '●' : '○'}`
             : `$(circle-slash) DAML Off`;
+            
         this.statusBarItem.tooltip = this.apiAvailable
-            ? `API Connected - ${this.threatCount} threats detected`
-            : 'API Disconnected - Start with: uvicorn main:app --host 0.0.0.0 --port 8000';
+            ? `API Connected | Compiler: ${this.compilerConfig.mode} | ${this.threatCount} threats`
+            : `API Disconnected | Compiler: ${this.compilerConfig.mode}\nStart server: uvicorn main:app --host 0.0.0.0 --port 8000`;
+            
         this.statusBarItem.backgroundColor =
             this.isEnabled && this.threatCount > 0 ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
     }
@@ -733,6 +951,8 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         );
         this._view.webview.html = this.getHtml(this._view.webview, scriptUri);
     }
+
+    // ── HTML Generation (Resolution Adaptive) ────────────────────────────────
 
     private getSeverityColor(severity: string): string {
         switch (severity) {
@@ -765,19 +985,115 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     }
 
     private getHtml(webview: vscode.Webview, scriptUri: vscode.Uri) {
+        // Build explanation panel HTML if available
+        let explanationHtml = '';
+        if (this.lastExplanation) {
+            const exp = this.lastExplanation;
+
+            // Error state
+            if (exp.error) {
+                explanationHtml = `
+                <div class="card p-3 mt-3 bg-yellow-500/10 border-l-4 border-l-yellow-500">
+                    <div class="flex items-center gap-2 mb-2">
+                        <i data-lucide="alert-circle" class="w-4 h-4 text-yellow-500"></i>
+                        <h3 class="text-responsive font-bold uppercase tracking-wider opacity-80">Explanation Unavailable</h3>
+                    </div>
+                    <p class="text-responsive-sm opacity-70">${exp.message}</p>
+                    <p class="text-responsive-xs opacity-50 mt-2">Make sure your FastAPI server is running the updated main_explain.py with the /explain endpoint.</p>
+                </div>
+                `;
+            } else {
+                const probPct = (exp.probability * 100).toFixed(1);
+                const predColor = exp.prediction === 'MALICIOUS' ? 'text-red-500' : 'text-green-500';
+                const predBg = exp.prediction === 'MALICIOUS' ? 'bg-red-500/10' : 'bg-green-500/10';
+
+                // Top features bars
+                const featureBars = exp.top_features.map((f: any) => {
+                    const maxAttr = exp.top_features[0].attribution;
+                    const pct = maxAttr > 0 ? (f.attribution / maxAttr * 100).toFixed(0) : '0';
+                    const dirColor = f.direction === 'malicious' ? 'bg-red-500' : 'bg-green-500';
+                    const dirIcon = f.direction === 'malicious' ? '↑' : '↓';
+                    return `
+                    <div class="mb-2">
+                        <div class="flex justify-between text-responsive-xs mb-0.5">
+                            <span class="truncate opacity-80" title="${f.feature}">${f.rank}. ${f.feature}</span>
+                            <span class="opacity-60">${dirIcon} ${f.group}</span>
+                        </div>
+                        <div class="w-full bg-[var(--border)] rounded-full h-1.5">
+                            <div class="${dirColor} h-1.5 rounded-full transition-all" style="width: ${pct}%"></div>
+                        </div>
+                    </div>
+                `;
+                }).join('');
+
+                // Group contributions
+                const groupBars = exp.groups.slice(0, 6).map((g: any) => {
+                    const dirColor = g.direction === 'malicious' ? 'text-red-400' : 'text-green-400';
+                    return `
+                    <div class="flex justify-between items-center text-responsive-xs py-1 border-b border-[var(--border)] last:border-0">
+                        <span class="capitalize opacity-80">${g.group.replace(/_/g, ' ')}</span>
+                        <span class="${dirColor} font-mono">${g.percentage}%</span>
+                    </div>
+                `;
+                }).join('');
+
+                const benignPushersHtml = exp.benign_pushers && exp.benign_pushers.length > 0
+                    ? exp.benign_pushers.slice(0, 8).map((bp: any) => `
+                    <div class="flex justify-between items-center text-responsive-xs py-1 border-b border-[var(--border)] last:border-0">
+                        <span class="opacity-80">${bp.feature}</span>
+                        <span class="text-green-400 font-mono">${bp.attribution.toFixed(4)} ↓</span>
+                    </div>
+                `).join('')
+                    : '<p class="text-responsive-xs opacity-50">No strong benign-pushing features detected.</p>';
+
+                explanationHtml = `
+            <div class="card p-3 mt-3 ${predBg} border-l-4 ${exp.prediction === 'MALICIOUS' ? 'border-l-red-500' : 'border-l-green-500'}">
+                <div class="flex justify-between items-center mb-2">
+                    <h3 class="text-responsive font-bold uppercase tracking-wider opacity-80">Explanation</h3>
+                    <span class="text-responsive-lg font-bold ${predColor}">${exp.prediction}</span>
+                </div>
+                <div class="mb-3">
+                    <div class="flex justify-between text-responsive-sm mb-1">
+                        <span class="opacity-60">Confidence</span>
+                        <span class="font-mono">${probPct}%</span>
+                    </div>
+                    <div class="w-full bg-[var(--border)] rounded-full h-2">
+                        <div class="${exp.prediction === 'MALICIOUS' ? 'bg-red-500' : 'bg-green-500'} h-2 rounded-full transition-all" style="width: ${probPct}%"></div>
+                    </div>
+                </div>
+                
+                <div class="mb-3">
+                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Top Influential Features</h4>
+                    ${featureBars}
+                </div>
+                
+                <div>
+                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Feature Group Impact</h4>
+                    ${groupBars}
+                </div>
+                
+                <div class="mt-3">
+                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">What Would Reduce the Score?</h4>
+                    ${benignPushersHtml}
+                </div>
+            </div>
+            `;
+            }
+        }
+
         const detectionsList = this.recentDetections
             .map(
-                (d) => '\n            <li class="p-2 flex items-center justify-between hover:bg-[var(--hover-bg)] cursor-pointer transition">\n                <div class="flex items-center gap-2 overflow-hidden">\n                    <i data-lucide="' + this.getSeverityIcon(d.severity) + '" class="w-3 h-3 ' + this.getSeverityColor(d.severity) + ' flex-shrink-0"></i>\n                    <div class="flex flex-col overflow-hidden">\n                        <span class="truncate opacity-90">' + d.file + '</span>\n                        <span class="text-[9px] opacity-50">' + (d.prob * 100).toFixed(1) + '% confidence</span>\n                    </div>\n                </div>\n                <span class="opacity-50 flex-shrink-0 ml-2 text-[9px]">' + d.time + '</span>\n            </li>\n        '
+                (d) => '\n            <li class="detection-item flex items-center justify-between hover:bg-[var(--hover-bg)] cursor-pointer transition">\n                <div class="flex items-center gap-2 overflow-hidden min-w-0">\n                    <i data-lucide="' + this.getSeverityIcon(d.severity) + '" class="w-3 h-3 ' + this.getSeverityColor(d.severity) + ' flex-shrink-0"></i>\n                    <div class="flex flex-col overflow-hidden min-w-0">\n                        <span class="truncate opacity-90 text-responsive">' + d.file + '</span>\n                        <span class="text-responsive-sm opacity-50">' + (d.prob * 100).toFixed(1) + '% confidence</span>\n                    </div>\n                </div>\n                <span class="opacity-50 flex-shrink-0 ml-2 text-responsive-sm">' + d.time + '</span>\n            </li>\n        '
             )
             .join('');
 
-        const emptyState = '\n            <li class="p-4 text-center opacity-50 text-[10px]">\n                <i data-lucide="shield-check" class="w-8 h-8 mx-auto mb-2 text-green-500"></i>\n                No threats detected\n            </li>\n        ';
+        const emptyState = '\n            <li class="detection-empty text-center opacity-50">\n                <i data-lucide="shield-check" class="w-8 h-8 mx-auto mb-2 text-green-500 icon-responsive"></i>\n                <span class="text-responsive">No threats detected</span>\n            </li>\n        ';
 
         const apiStatusClass = this.apiAvailable ? 'text-green-400' : 'text-red-400';
         const apiStatusPulse = this.apiAvailable ? '' : 'pulse';
-        const apiStatusText = this.apiAvailable ? '' : '<span class="text-[9px] text-red-400 ml-2">Offline</span>';
+        const apiStatusText = this.apiAvailable ? '' : '<span class="text-responsive-sm text-red-400 ml-2">Offline</span>';
 
-        return '<!DOCTYPE html>\n        <html>\n        <head>\n            <script src="https://cdn.tailwindcss.com"></script>\n            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n            <script src="https://unpkg.com/lucide@latest"></script>\n            <style>\n                :root {\n                    --bg: var(--vscode-sideBar-background);\n                    --fg: var(--vscode-foreground);\n                    --border: var(--vscode-widget-border);\n                    --card-bg: var(--vscode-editor-background);\n                    --hover-bg: var(--vscode-list-hoverBackground);\n                }\n                body { background: var(--bg); color: var(--fg); font-family: var(--vscode-font-family); padding: 12px; overflow-x: hidden; }\n                .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; }\n                .chart-container { height: 160px; width: 100%; position: relative; }\n                ::-webkit-scrollbar { width: 6px; }\n                ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }\n                .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }\n                @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }\n            </style>\n        </head>\n        <body class="flex flex-col h-[100vh]">\n            <div class="flex flex-col space-y-4 flex-none">\n                <div class="flex justify-between items-center border-b border-[var(--border)] pb-2">\n                    <div class="flex items-center gap-2">\n                        <i data-lucide="shield" class="w-4 h-4 ' + apiStatusClass + ' ' + apiStatusPulse + '"></i>\n                        <h1 class="text-xs font-bold uppercase tracking-wider opacity-80">DAML Status</h1>\n                        ' + apiStatusText + '\n                    </div>\n                    <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white px-2 py-1 rounded text-[10px] ' + (this.threatCount === 0 ? 'opacity-50' : '') + '" ' + (this.threatCount === 0 ? 'disabled' : '') + '>Clear</button>\n                </div>\n\n                <div class="grid grid-cols-2 gap-2">\n                    <div class="card p-3 flex flex-col items-center justify-center text-center">\n                        <p class="text-[10px] opacity-60 uppercase mb-1"><i data-lucide="alert-triangle" class="w-3 h-3 ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + ' inline"></i> Threats</p>\n                        <p class="text-2xl font-bold ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + '">' + this.threatCount + '</p>\n                    </div>\n                    <div class="card p-3 flex flex-col items-center justify-center text-center">\n                        <p class="text-[10px] opacity-60 uppercase mb-1"><i data-lucide="activity" class="w-3 h-3 ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> API</p>\n                        <p class="text-2xl font-bold ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + '">' + (this.apiAvailable ? 'ON' : 'OFF') + '</p>\n                    </div>\n                </div>\n\n                <div class="card p-2 chart-container">\n                    <div class="flex justify-between items-center mb-1">\n                        <span class="text-[9px] opacity-60 uppercase">Live Activity (60m)</span>\n                        <button id="reset-graph-btn" class="text-[9px] px-1.5 py-0.5 rounded bg-[var(--border)] hover:opacity-80 transition opacity-60">Reset</button>\n                    </div>\n                    <canvas id="rollingChart"></canvas>\n                </div>\n\n                <div>\n                    <h2 class="text-[10px] font-bold uppercase opacity-60 mb-2">Actions</h2>\n                    <div class="grid grid-cols-2 gap-2">\n                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanPeFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="shield" class="w-4 h-4 text-blue-400"></i>\n                            <span>Scan PE File</span>\n                        </button>\n                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanWorkspace\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="folder-search" class="w-4 h-4 text-blue-400"></i>\n                            <span>Scan Workspace</span>\n                        </button>\n                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanActiveFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="file-search" class="w-4 h-4 text-purple-400"></i>\n                            <span>Scan Active File</span>\n                        </button>\n                        <button class="card p-2 text-[10px] flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer" onclick="vscode.postMessage({command: \'resolveThreats\'})">\n                            <i data-lucide="check-circle" class="w-4 h-4 text-green-400"></i>\n                            <span>Clear Threats</span>\n                        </button>\n                    </div>\n                </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-grow overflow-hidden">\n                <h2 class="text-[10px] font-bold uppercase opacity-60 mb-2">Recent Detections</h2>\n                <div class="card p-0 overflow-y-auto flex-grow h-32">\n                    <ul class="text-[10px] divide-y divide-[var(--border)]">\n                        ' + (this.recentDetections.length > 0 ? detectionsList : emptyState) + '\n                    </ul>\n                </div>\n            </div>\n\n            <div class="mt-3 flex justify-between items-center text-[9px] opacity-50 border-t border-[var(--border)] pt-2 flex-none">\n                <span>EMBER-LSTM Engine</span>\n                <span><i data-lucide="' + (this.apiAvailable ? 'check-circle' : 'x-circle') + '" class="w-3 h-3 ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> ' + (this.apiAvailable ? 'Ready' : 'Disconnected') + '</span>\n            </div>\n\n            <script>\n                const vscode = acquireVsCodeApi();\n                document.getElementById(\'clear-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resolveThreats\'}));\n                document.getElementById(\'reset-graph-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resetGraph\'}));\n                lucide.createIcons();\n                const slots = Array.from({length: 12}, (_, i) => \'-\' + ((11-i)*5) + \'m\');\n                new Chart(document.getElementById(\'rollingChart\'), {\n                    type: \'line\',\n                    data: { labels: slots, datasets: [{ label: \'Threats\', data: [' + this.rollingHistory.join(',') + '], borderColor: \'rgb(239,68,68)\', backgroundColor: \'rgba(239,68,68,0.1)\', fill: true, tension: 0.4, pointRadius: 3, pointHoverRadius: 5 }] },\n                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: true, ticks: { maxTicksLimit: 6, font: { size: 9 }, color: \'var(--fg)\' }, grid: { display: false } }, y: { display: true, beginAtZero: true, ticks: { font: { size: 9 }, color: \'var(--fg)\', maxTicksLimit: 4, stepSize: 1 }, grid: { color: \'var(--border)\' } } } }\n                });\n            </script>\n            <script src="' + scriptUri.toString() + '"></script>\n        </body>\n        </html>';
+        return '<!DOCTYPE html>\n        <html>\n        <head>\n            <meta name="viewport" content="width=device-width, initial-scale=1.0">\n            <script src="https://cdn.tailwindcss.com"></script>\n            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n            <script src="https://unpkg.com/lucide@latest"></script>\n            <style>\n                :root {\n                    --bg: var(--vscode-sideBar-background);\n                    --fg: var(--vscode-foreground);\n                    --border: var(--vscode-widget-border);\n                    --card-bg: var(--vscode-editor-background);\n                    --hover-bg: var(--vscode-list-hoverBackground);\n                    --sidebar-width: 100%;\n                }\n                \n                /* Base responsive font scaling */\n                html { font-size: clamp(10px, 0.8vw + 6px, 14px); }\n                \n                body { \n                    background: var(--bg); \n                    color: var(--fg); \n                    font-family: var(--vscode-font-family); \n                    padding: clamp(8px, 1vw, 16px); \n                    overflow-x: hidden; \n                    min-height: 100vh;\n                }\n                \n                .card { \n                    background: var(--card-bg); \n                    border: 1px solid var(--border); \n                    border-radius: clamp(4px, 0.5vw, 8px); \n                }\n                \n                .chart-container { \n                    height: clamp(120px, 25vh, 200px); \n                    width: 100%; \n                    position: relative; \n                }\n                \n                /* Responsive text sizes */\n                .text-responsive { font-size: clamp(0.7rem, 0.8vw + 0.3rem, 1rem); }\n                .text-responsive-sm { font-size: clamp(0.6rem, 0.6vw + 0.2rem, 0.85rem); }\n                .text-responsive-lg { font-size: clamp(1.2rem, 2vw + 0.5rem, 2.5rem); }\n                .text-responsive-xs { font-size: clamp(0.55rem, 0.5vw + 0.15rem, 0.75rem); }\n                \n                /* Responsive spacing */\n                .p-responsive { padding: clamp(6px, 1vw, 12px); }\n                .gap-responsive { gap: clamp(4px, 0.8vw, 8px); }\n                \n                /* Responsive icons */\n                .icon-responsive { \n                    width: clamp(16px, 2vw, 24px); \n                    height: clamp(16px, 2vw, 24px); \n                }\n                .icon-responsive-sm { \n                    width: clamp(12px, 1.5vw, 16px); \n                    height: clamp(12px, 1.5vw, 16px); \n                }\n                \n                /* Detection list items */\n                .detection-item { \n                    padding: clamp(6px, 1vw, 10px); \n                    border-bottom: 1px solid var(--border);\n                }\n                .detection-empty { \n                    padding: clamp(12px, 2vw, 20px); \n                }\n                \n                /* Scrollbar */\n                ::-webkit-scrollbar { width: clamp(4px, 0.6vw, 8px); }\n                ::-webkit-scrollbar-thumb { \n                    background: var(--border); \n                    border-radius: clamp(2px, 0.3vw, 4px); \n                }\n                \n                /* Pulse animation */\n                .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }\n                @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }\n                \n                /* Grid responsive */\n                .grid-responsive { \n                    display: grid; \n                    grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); \n                    gap: clamp(4px, 1vw, 8px); \n                }\n                \n                /* Button responsive */\n                .btn-responsive {\n                    padding: clamp(4px, 0.8vw, 8px) clamp(6px, 1vw, 12px);\n                    font-size: clamp(0.65rem, 0.7vw + 0.2rem, 0.9rem);\n                    border-radius: clamp(3px, 0.4vw, 6px);\n                }\n                \n                /* Status header responsive */\n                .header-responsive {\n                    padding-bottom: clamp(6px, 1vw, 12px);\n                    margin-bottom: clamp(8px, 1.5vw, 16px);\n                }\n                \n                /* Chart canvas responsive */\n                canvas { max-height: 100% !important; }\n                \n                /* Hide on very small */\n                @media (max-width: 200px) {\n                    .hide-narrow { display: none; }\n                }\n                \n                /* Compact mode for very small sidebar */\n                @media (max-width: 180px) {\n                    .compact-hide { display: none; }\n                    .grid-responsive { grid-template-columns: 1fr; }\n                }\n            </style>\n        </head>\n        <body class="flex flex-col min-h-[100vh]">\n            <div class="flex flex-col space-y-4 flex-none">\n                <div class="flex justify-between items-center border-b border-[var(--border)] header-responsive">\n                    <div class="flex items-center gap-2 min-w-0">\n                        <i data-lucide="shield" class="icon-responsive ' + apiStatusClass + ' ' + apiStatusPulse + ' flex-shrink-0"></i>\n                        <h1 class="text-responsive font-bold uppercase tracking-wider opacity-80 truncate hide-narrow">DAML Status</h1>\n                        ' + apiStatusText + '\n                    </div>\n                    <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white btn-responsive flex-shrink-0 ' + (this.threatCount === 0 ? 'opacity-50' : '') + '" ' + (this.threatCount === 0 ? 'disabled' : '') + '>Clear</button>\n                </div>\n\n                <div class="grid-responsive">\n                    <div class="card p-responsive flex flex-col items-center justify-center text-center">\n                        <p class="text-responsive-xs opacity-60 uppercase mb-1"><i data-lucide="alert-triangle" class="icon-responsive-sm ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + ' inline"></i> <span class="hide-narrow">Threats</span></p>\n                        <p class="text-responsive-lg font-bold ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + '">' + this.threatCount + '</p>\n                    </div>\n                    <div class="card p-responsive flex flex-col items-center justify-center text-center">\n                        <p class="text-responsive-xs opacity-60 uppercase mb-1"><i data-lucide="activity" class="icon-responsive-sm ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> <span class="hide-narrow">API</span></p>\n                        <p class="text-responsive-lg font-bold ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + '">' + (this.apiAvailable ? 'ON' : 'OFF') + '</p>\n                    </div>\n                </div>\n\n                <div class="card p-2 chart-container">\n                    <div class="flex justify-between items-center mb-1">\n                        <span class="text-responsive-xs opacity-60 uppercase">Live Activity (60m)</span>\n                        <button id="reset-graph-btn" class="text-responsive-xs px-1.5 py-0.5 rounded bg-[var(--border)] hover:opacity-80 transition opacity-60">Reset</button>\n                    </div>\n                    <canvas id="rollingChart"></canvas>\n                </div>\n\n                <div>\n                    <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Actions</h2>\n                    <div class="grid-responsive">\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanPeFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="shield" class="icon-responsive text-blue-400"></i>\n                            <span class="compact-hide">Scan PE</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanWorkspace\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="folder-search" class="icon-responsive text-blue-400"></i>\n                            <span class="compact-hide">Workspace</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanActiveFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="file-search" class="icon-responsive text-purple-400"></i>\n                            <span class="compact-hide">Active File</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer" onclick="vscode.postMessage({command: \'resolveThreats\'})">\n                            <i data-lucide="check-circle" class="icon-responsive text-green-400"></i>\n                            <span class="compact-hide">Clear</span>\n                        </button>\n                    </div>\n                </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-grow overflow-hidden">\n                <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Recent Detections</h2>\n                <div class="card p-0 overflow-y-auto flex-grow" style="min-height: clamp(80px, 15vh, 150px);">\n                    <ul class="text-responsive divide-y divide-[var(--border)]">\n                        ' + (this.recentDetections.length > 0 ? detectionsList : emptyState) + '\n                    </ul>\n                </div>\n            </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-none">\n                <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Last Scan Explanation</h2>\n                ' + explanationHtml + '\n            </div>\n\n            <div class="mt-3 flex justify-between items-center text-responsive-xs opacity-50 border-t border-[var(--border)] pt-2 flex-none">\n                <span class="hide-narrow">EMBER-LSTM</span>\n                <span><i data-lucide="' + (this.apiAvailable ? 'check-circle' : 'x-circle') + '" class="icon-responsive-sm ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> ' + (this.apiAvailable ? 'Ready' : 'Disconnected') + '</span>\n            </div>\n\n            <script>\n                const vscode = acquireVsCodeApi();\n                document.getElementById(\'clear-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resolveThreats\'}));\n                document.getElementById(\'reset-graph-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resetGraph\'}));\n                lucide.createIcons();\n                \n                // Responsive chart sizing\n                const chartContainer = document.querySelector(\'.chart-container\');\n                const slots = Array.from({length: 12}, (_, i) => \'-\' + ((11-i)*5) + \'m\');\n                \n                const chart = new Chart(document.getElementById(\'rollingChart\'), {\n                    type: \'line\',\n                    data: { \n                        labels: slots, \n                        datasets: [{ \n                            label: \'Threats\', \n                            data: [' + this.rollingHistory.join(',') + '], \n                            borderColor: \'rgb(239,68,68)\', \n                            backgroundColor: \'rgba(239,68,68,0.1)\', \n                            fill: true, \n                            tension: 0.4, \n                            pointRadius: Math.max(2, Math.min(4, window.innerWidth / 200)), \n                            pointHoverRadius: Math.max(3, Math.min(6, window.innerWidth / 150)) \n                        }] \n                    },\n                    options: { \n                        responsive: true, \n                        maintainAspectRatio: false, \n                        plugins: { \n                            legend: { display: false } \n                        }, \n                        scales: { \n                            x: { \n                                display: true, \n                                ticks: { \n                                    maxTicksLimit: Math.max(4, Math.min(8, Math.floor(window.innerWidth / 80))), \n                                    font: { size: Math.max(8, Math.min(11, window.innerWidth / 80)) }, \n                                    color: \'var(--fg)\' \n                                }, \n                                grid: { display: false } \n                            }, \n                            y: { \n                                display: true, \n                                beginAtZero: true, \n                                ticks: { \n                                    font: { size: Math.max(8, Math.min(11, window.innerWidth / 80)) }, \n                                    color: \'var(--fg)\', \n                                    maxTicksLimit: Math.max(3, Math.min(5, Math.floor(window.innerHeight / 100))), \n                                    stepSize: 1 \n                                }, \n                                grid: { color: \'var(--border)\' } \n                            } \n                        } \n                    }\n                });\n                \n                // Resize observer for dynamic chart updates\n                const resizeObserver = new ResizeObserver(entries => {\n                    for (let entry of entries) {\n                        const width = entry.contentRect.width;\n                        chart.options.scales.x.ticks.font.size = Math.max(8, Math.min(11, width / 80));\n                        chart.options.scales.x.ticks.maxTicksLimit = Math.max(4, Math.min(8, Math.floor(width / 80)));\n                        chart.options.scales.y.ticks.font.size = Math.max(8, Math.min(11, width / 80));\n                        chart.update(\'none\');\n                    }\n                });\n                resizeObserver.observe(chartContainer);\n            </script>\n            <script src="' + scriptUri.toString() + '"></script>\n        </body>\n        </html>';
     }
 }
 
