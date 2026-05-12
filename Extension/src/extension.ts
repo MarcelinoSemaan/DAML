@@ -95,7 +95,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         this.updateStatusBar();
         this.statusBarItem.show();
 
-        // ── FIX: Auto-start bundled server instead of just checking ──
         this.ensureServerRunning();
 
         setInterval(() => this.checkApiHealth(), 5000);
@@ -115,38 +114,47 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         await this.checkApiHealth();
         if (this.apiAvailable) return;
 
-        const serverDir = path.join(this.context.extensionPath, 'AI Model');
+        const extensionRoot = this.context.extensionPath;
+        const serverDir = path.join(extensionRoot, 'AI Model');
         const mainPy = path.join(serverDir, 'main.py');
 
         if (!fs.existsSync(mainPy)) {
             vscode.window.showWarningMessage(
-                'DAML model not bundled. Start server manually: uvicorn main:app --host 0.0.0.0 --port 8000'
-            );
-            return;
-        }
-
-        const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
-
-        try {
-            await execPromise(`${pythonCmd} --version`, { timeout: 5000 });
-        } catch {
-            vscode.window.showErrorMessage(
-                'Python not found. Install Python 3.8+ and run: pip install fastapi uvicorn torch numpy thrember'
+                'DAML model not bundled. Expected main.py in "AI Model" folder. Start server manually: uvicorn main:app --host 0.0.0.0 --port 8000'
             );
             return;
         }
 
         vscode.window.showInformationMessage('Starting DAML AI model...');
 
-        this.serverProcess = spawn(
-            pythonCmd,
-            ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8000'],
-            {
-                cwd: serverDir,
-                shell: false,
-                stdio: 'pipe'
-            }
-        );
+        const isWin = process.platform === 'win32';
+
+        if (isWin) {
+            // Windows: no 'source' command, call venv python directly
+            const pythonPath = path.join(extensionRoot, '.venv', 'Scripts', 'python.exe');
+            const pythonCmd = fs.existsSync(pythonPath) ? pythonPath : 'python';
+
+            this.serverProcess = spawn(
+                pythonCmd,
+                ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8000'],
+                {
+                    cwd: serverDir,
+                    shell: false,
+                    stdio: 'pipe'
+                }
+            );
+        } else {
+            // macOS / Linux: source venv from extension root, then cd into AI Model to run uvicorn
+            this.serverProcess = spawn(
+                'bash',
+                ['-c', 'source ./.venv/bin/activate && cd "AI Model" && python -m uvicorn main:app --host 127.0.0.1 --port 8000'],
+                {
+                    cwd: extensionRoot,
+                    shell: false,
+                    stdio: 'pipe'
+                }
+            );
+        }
 
         this.serverProcess.stdout?.on('data', (data: Buffer) => {
             console.log(`[DAML Model] ${data.toString().trim()}`);
