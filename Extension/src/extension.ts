@@ -130,7 +130,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         const isWin = process.platform === 'win32';
 
         if (isWin) {
-            // Windows: no 'source' command, call venv python directly
             const pythonPath = path.join(extensionRoot, '.venv', 'Scripts', 'python.exe');
             const pythonCmd = fs.existsSync(pythonPath) ? pythonPath : 'python';
 
@@ -144,7 +143,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 }
             );
         } else {
-            // macOS / Linux: source venv from extension root, then cd into AI Model to run uvicorn
             this.serverProcess = spawn(
                 'bash',
                 ['-c', 'source ./.venv/bin/activate && cd "AI Model" && python -m uvicorn main:app --host 127.0.0.1 --port 8000'],
@@ -1100,7 +1098,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                         <h3 class="text-responsive font-bold uppercase tracking-wider opacity-80">Explanation Unavailable</h3>
                     </div>
                     <p class="text-responsive-sm opacity-70">${exp.message}</p>
-                    <p class="text-responsive-xs opacity-50 mt-2">Make sure your FastAPI server is running the updated main_explain.py with the /explain endpoint.</p>
+                    <p class="text-responsive-sm opacity-70 mt-2">Make sure your FastAPI server is running the updated main_explain.py with the /explain endpoint.</p>
                 </div>
                 `;
             } else {
@@ -1115,9 +1113,9 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                     const dirIcon = f.direction === 'malicious' ? '↑' : '↓';
                     return `
                     <div class="mb-2">
-                        <div class="flex justify-between text-responsive-xs mb-0.5">
-                            <span class="truncate opacity-80" title="${f.feature}">${f.rank}. ${f.feature}</span>
-                            <span class="opacity-60">${dirIcon} ${f.group}</span>
+                        <div class="flex justify-between text-responsive-sm mb-1">
+                            <span class="truncate opacity-90" title="${f.feature}">${f.rank}. ${f.feature}</span>
+                            <span class="opacity-70">${dirIcon} ${f.group}</span>
                         </div>
                         <div class="w-full bg-[var(--border)] rounded-full h-1.5">
                             <div class="${dirColor} h-1.5 rounded-full transition-all" style="width: ${pct}%"></div>
@@ -1129,8 +1127,8 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 const groupBars = exp.groups.slice(0, 6).map((g: any) => {
                     const dirColor = g.direction === 'malicious' ? 'text-red-400' : 'text-green-400';
                     return `
-                    <div class="flex justify-between items-center text-responsive-xs py-1 border-b border-[var(--border)] last:border-0">
-                        <span class="capitalize opacity-80">${g.group.replace(/_/g, ' ')}</span>
+                    <div class="flex justify-between items-center text-responsive-sm py-1.5 border-b border-[var(--border)] last:border-0">
+                        <span class="capitalize opacity-90">${g.group.replace(/_/g, ' ')}</span>
                         <span class="${dirColor} font-mono">${g.percentage}%</span>
                     </div>
                 `;
@@ -1139,18 +1137,18 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 const recommendationsHtml = exp.recommendations && exp.recommendations.length > 0
                     ? exp.recommendations.map((rec: any) => `
                     <div class="mb-2 p-2 bg-[var(--border)]/30 rounded">
-                        <div class="text-responsive-xs font-bold opacity-80 mb-1">${rec.feature} <span class="opacity-50">(${rec.group})</span></div>
-                        <div class="text-responsive-xs opacity-70 leading-relaxed">${rec.advice}</div>
+                        <div class="text-responsive-sm font-bold opacity-90 mb-1">${rec.feature} <span class="opacity-60">(${rec.group})</span></div>
+                        <div class="text-responsive-sm opacity-90 leading-relaxed">${rec.advice}</div>
                     </div>
                 `).join('')
                     : (exp.benign_pushers && exp.benign_pushers.length > 0
                         ? exp.benign_pushers.slice(0, 8).map((bp: any) => `
-                        <div class="flex justify-between items-center text-responsive-xs py-1 border-b border-[var(--border)] last:border-0">
-                            <span class="opacity-80">${bp.feature}</span>
+                        <div class="flex justify-between items-center text-responsive-sm py-1.5 border-b border-[var(--border)] last:border-0">
+                            <span class="opacity-90">${bp.feature}</span>
                             <span class="text-green-400 font-mono">${bp.attribution.toFixed(4)} ↓</span>
                         </div>
                     `).join('')
-                        : '<p class="text-responsive-xs opacity-50">No remediation advice available.</p>');
+                        : '<p class="text-responsive-sm opacity-70">No remediation advice available.</p>');
 
                 explanationHtml = `
             <div class="card p-3 mt-3 ${predBg} border-l-4 ${exp.prediction === 'MALICIOUS' ? 'border-l-red-500' : 'border-l-green-500'}">
@@ -1160,7 +1158,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 </div>
                 <div class="mb-3">
                     <div class="flex justify-between text-responsive-sm mb-1">
-                        <span class="opacity-60">Confidence</span>
+                        <span class="opacity-70">Confidence</span>
                         <span class="font-mono">${probPct}%</span>
                     </div>
                     <div class="w-full bg-[var(--border)] rounded-full h-2">
@@ -1169,17 +1167,17 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 </div>
                 
                 <div class="mb-3">
-                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Top Influential Features</h4>
+                    <h4 class="text-responsive-sm font-bold uppercase opacity-80 mb-2">Top Influential Features</h4>
                     ${featureBars}
                 </div>
                 
                 <div>
-                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Feature Group Impact</h4>
+                    <h4 class="text-responsive-sm font-bold uppercase opacity-80 mb-2">Feature Group Impact</h4>
                     ${groupBars}
                 </div>
                 
                 <div class="mt-3">
-                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">How to Lower the Score</h4>
+                    <h4 class="text-responsive-sm font-bold uppercase opacity-80 mb-2">How to Lower the Score</h4>
                     ${recommendationsHtml}
                 </div>
             </div>
