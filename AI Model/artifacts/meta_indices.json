@@ -1,0 +1,1 @@
+{"indices": [2, 7, 264, 276, 286, 299, 575, 688], "names": ["authenticode.latest_signing_time", "authenticode.signing_time_diff", "first_submission_date", "header.coff.timestamp", "header.dos.e_magic", "header.optional.magic", "last_analysis_date", "week_id"]}

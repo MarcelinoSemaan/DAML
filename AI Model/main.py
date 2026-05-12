@@ -131,7 +131,9 @@ def flatten_record(record: dict, prefix: str = "") -> dict:
             out[full_key] = 0.0 if not np.isfinite(val) else val
     return out
 
-
+with open("artifacts/meta_indices.json") as f:
+    META_INDICES = json.load(f)["indices"]
+    
 def record_to_features(record: dict, feat_cols: list, scaler):
     """Raw EMBER record dict → (N_TIMESTEPS, TARGET_NF) array."""
     flat = flatten_record(record)
@@ -143,6 +145,12 @@ def record_to_features(record: dict, feat_cols: list, scaler):
         idx = col_index.get(col)
         if idx is not None:
             x_raw[idx] = float(val)
+
+    # ── FAST FIX: neutralize metadata columns ──
+    # Set missing metadata to training mean so scaler outputs 0 (neutral)
+    for idx in META_INDICES:
+        if x_raw[idx] == 0.0:  # Only fix missing/unset metadata
+            x_raw[idx] = scaler.mean_[idx]
 
     x_scaled = scaler.transform(x_raw.reshape(1, -1))[0].astype(np.float32)
     n_timesteps = max(1, math.ceil(n_cols / TARGET_NF))
