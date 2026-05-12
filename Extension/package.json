@@ -1,13 +1,24 @@
 {
   "name": "daml-dashboard",
-  "displayName": "daml-dashboard",
-  "description": "",
+  "displayName": "DAML Protection",
+  "description": "AI-powered malware detection dashboard using EMBER-LSTM engine",
   "version": "0.0.1",
+  "publisher": "Marcelino-Ahmad",
+  "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.109.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Machine Learning",
+    "Visualization"
+  ],
+  "keywords": [
+    "malware",
+    "security",
+    "pe",
+    "detection",
+    "ai"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -19,7 +30,7 @@
         {
           "id": "daml-explorer",
           "title": "DAML Protection",
-          "icon": "$(shield)"
+          "icon": "media/icon.svg"
         }
       ]
     },
@@ -60,6 +71,11 @@
       {
         "command": "daml.toggleStatusView",
         "title": "DAML: Turn Protection On/Off"
+      },
+      {
+        "command": "daml.selectCompiler",
+        "title": "DAML: Select Compiler",
+        "category": "DAML"
       }
     ]
   },
@@ -81,7 +97,7 @@
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "eslint": "^9.39.2",
-    "ts-loader": "^9.5.4",
+    "ts-loader": "9.5.4",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.54.0",
     "webpack": "^5.104.1",
