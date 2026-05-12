@@ -1,27 +1,12 @@
-# Source files
-src/
-out/
-*.tsbuildinfo
-
-# Build config
-webpack.config.js
-tsconfig.json
-.eslintrc.*
-
-# Dev dependencies
-node_modules/
-package-lock.json
-
-# Tests
-test/
-out/test/
-
-# Maps (optional - remove if you want debug support)
-*.map
-
-# Git
-.git/
+.vscode/**
+.vscode-test/**
+src/**
 .gitignore
-
-# Python server (keep separate)
-../AI Model/
+.yarnrc
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/.eslintrc.json
+**/*.map
+**/*.ts
+!AI Model/**
+!AI Model/**/*

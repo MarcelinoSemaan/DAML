@@ -46,8 +46,11 @@ const DEFAULT_COMPILERS: Record<CompilerMode, CompilerConfig> = {
 
 // ── Activation ─────────────────────────────────────────────────────────────
 
+let _provider: DamlDashboardProvider | null = null;
+
 export function activate(context: vscode.ExtensionContext) {
     const provider = new DamlDashboardProvider(context);
+    _provider = provider;
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('daml.dashboardView', provider),
@@ -58,8 +61,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('daml.scanPeFile', () => provider.scanPeFilePicker()),
         vscode.commands.registerCommand('daml.scanJsonClipboard', () => provider.scanJsonClipboard()),
         vscode.commands.registerCommand('daml.selectCompiler', () => provider.selectCompiler()),
-        vscode.commands.registerCommand('daml.forceRebuild', () => provider.forceRebuildActiveFile())
+        vscode.commands.registerCommand('daml.forceRebuild', () => provider.forceRebuildActiveFile()),
+        { dispose: () => provider.killServer() }
     );
+}
+
+export function deactivate() {
+    _provider?.killServer();
 }
 
 // ── Dashboard Provider ─────────────────────────────────────────────────────
@@ -74,6 +82,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     private rollingHistory: number[] = new Array(12).fill(0);
     private apiAvailable: boolean = false;
     private compilerConfig: CompilerConfig;
+    private serverProcess: any = null;
 
     constructor(private context: vscode.ExtensionContext) {
         this.rollingHistory = this.context.globalState.get<number[]>('daml.rollingHistory', new Array(12).fill(0));
@@ -86,9 +95,76 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         this.updateStatusBar();
         this.statusBarItem.show();
 
-        this.checkApiHealth();
+        // ── FIX: Auto-start bundled server instead of just checking ──
+        this.ensureServerRunning();
+
         setInterval(() => this.checkApiHealth(), 5000);
         setInterval(() => this.shiftRollingWindow(), 300000);
+    }
+
+    // ── Bundled Server Auto-Start ──────────────────────────────────────────
+
+    public killServer() {
+        if (this.serverProcess) {
+            this.serverProcess.kill();
+            this.serverProcess = null;
+        }
+    }
+
+    private async ensureServerRunning() {
+        await this.checkApiHealth();
+        if (this.apiAvailable) return;
+
+        const serverDir = path.join(this.context.extensionPath, 'AI Model');
+        const mainPy = path.join(serverDir, 'main.py');
+
+        if (!fs.existsSync(mainPy)) {
+            vscode.window.showWarningMessage(
+                'DAML model not bundled. Start server manually: uvicorn main:app --host 0.0.0.0 --port 8000'
+            );
+            return;
+        }
+
+        const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+
+        try {
+            await execPromise(`${pythonCmd} --version`, { timeout: 5000 });
+        } catch {
+            vscode.window.showErrorMessage(
+                'Python not found. Install Python 3.8+ and run: pip install fastapi uvicorn torch numpy thrember'
+            );
+            return;
+        }
+
+        vscode.window.showInformationMessage('Starting DAML AI model...');
+
+        this.serverProcess = spawn(
+            pythonCmd,
+            ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8000'],
+            {
+                cwd: serverDir,
+                shell: false,
+                stdio: 'pipe'
+            }
+        );
+
+        this.serverProcess.stdout?.on('data', (data: Buffer) => {
+            console.log(`[DAML Model] ${data.toString().trim()}`);
+        });
+        this.serverProcess.stderr?.on('data', (data: Buffer) => {
+            console.error(`[DAML Model] ${data.toString().trim()}`);
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 6000));
+        await this.checkApiHealth();
+
+        if (this.apiAvailable) {
+            vscode.window.showInformationMessage('DAML AI model started successfully.');
+        } else {
+            vscode.window.showErrorMessage(
+                'DAML model failed to start. Check dependencies: pip install fastapi uvicorn torch numpy thrember'
+            );
+        }
     }
 
     // ── Compiler Selection ─────────────────────────────────────────────────
@@ -364,94 +440,90 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     }
 
     public async scanWorkspace() {
-    if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
-    if (!this.apiAvailable) {
-        const action = await vscode.window.showWarningMessage(
-            'DAML API server not running. Start it with: uvicorn main:app --host 0.0.0.0 --port 8000',
-            'Retry',
-            'Cancel'
+        if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
+        if (!this.apiAvailable) {
+            const action = await vscode.window.showWarningMessage(
+                'DAML API server not running. Start it with: uvicorn main:app --host 0.0.0.0 --port 8000',
+                'Retry',
+                'Cancel'
+            );
+            if (action === 'Retry') {
+                await this.checkApiHealth();
+                if (this.apiAvailable) this.scanWorkspace();
+            }
+            return;
+        }
+
+        vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: 'DAML Scanning Workspace...', cancellable: true },
+            async (progress, token) => {
+                const exeFiles = await vscode.workspace.findFiles('**/*.exe', '**/node_modules/**', 50);
+                const sourceFiles = await vscode.workspace.findFiles('**/*.{ts,js,py,cpp,c}', '**/node_modules/**', 50);
+
+                if (exeFiles.length === 0 && sourceFiles.length === 0) {
+                    vscode.window.showInformationMessage('No source files or compiled EXEs found.');
+                    return;
+                }
+
+                let scanned = 0;
+                const threats: typeof this.recentDetections = [];
+                const totalFiles = exeFiles.length + sourceFiles.length;
+
+                for (const file of exeFiles) {
+                    if (token.isCancellationRequested) break;
+                    progress.report({ message: `Scanning ${path.basename(file.fsPath)}...`, increment: 100 / totalFiles });
+
+                    try {
+                        const result = await this.scanBinary(file.fsPath, false);
+                        if (result && result.is_malicious) {
+                            this.recordDetection();
+                            threats.push({
+                                file: path.basename(file.fsPath),
+                                severity: result.confidence === 'high' ? 'critical' : result.confidence,
+                                time: 'just now',
+                                prob: result.malicious_probability
+                            });
+                        }
+                    } catch (err: any) {
+                        console.log(`Skipping ${file.fsPath}: ${err}`);
+                    }
+                    scanned++;
+                }
+
+                for (const file of sourceFiles) {
+                    if (token.isCancellationRequested) break;
+                    progress.report({ message: `Building ${path.basename(file.fsPath)}...`, increment: 100 / totalFiles });
+
+                    try {
+                        const result = await this.buildAndScan(file.fsPath, false);
+                        if (result && result.is_malicious) {
+                            this.recordDetection();
+                            threats.push({
+                                file: path.basename(file.fsPath),
+                                severity: result.confidence === 'high' ? 'critical' : result.confidence,
+                                time: 'just now',
+                                prob: result.malicious_probability
+                            });
+                        }
+                    } catch (err: any) {
+                        console.log(`Skipping ${file.fsPath}: ${err}`);
+                    }
+                    scanned++;
+                }
+
+                this.threatCount += threats.length;
+                this.recentDetections = [...threats, ...this.recentDetections].slice(0, 10);
+                this.updateStatusBar();
+                this.updateWebview();
+
+                if (threats.length > 0) {
+                    vscode.window.showWarningMessage(`DAML: Found ${threats.length} potential threats!`);
+                } else {
+                    vscode.window.showInformationMessage(`DAML: Scanned ${scanned} files. No threats.`);
+                }
+            }
         );
-        if (action === 'Retry') {
-            await this.checkApiHealth();
-            if (this.apiAvailable) this.scanWorkspace();
-        }
-        return;
     }
-
-    vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'DAML Scanning Workspace...', cancellable: true },
-        async (progress, token) => {
-            // ── FIX 1: Also look for existing EXEs ──
-            const exeFiles = await vscode.workspace.findFiles('**/*.exe', '**/node_modules/**', 50);
-            const sourceFiles = await vscode.workspace.findFiles('**/*.{ts,js,py,cpp,c}', '**/node_modules/**', 50);
-
-            if (exeFiles.length === 0 && sourceFiles.length === 0) {
-                vscode.window.showInformationMessage('No source files or compiled EXEs found.');
-                return;
-            }
-
-            let scanned = 0;
-            const threats: typeof this.recentDetections = [];
-            const totalFiles = exeFiles.length + sourceFiles.length;
-
-            // Scan existing EXEs directly (no rebuild needed)
-            for (const file of exeFiles) {
-                if (token.isCancellationRequested) break;
-                progress.report({ message: `Scanning ${path.basename(file.fsPath)}...`, increment: 100 / totalFiles });
-
-                try {
-                    const result = await this.scanBinary(file.fsPath, false);
-                    if (result && result.is_malicious) {
-                        this.recordDetection();
-                        threats.push({
-                            file: path.basename(file.fsPath),
-                            severity: result.confidence === 'high' ? 'critical' : result.confidence,
-                            time: 'just now',
-                            prob: result.malicious_probability
-                        });
-                    }
-                } catch (err: any) {
-                    console.log(`Skipping ${file.fsPath}: ${err}`);
-                }
-                scanned++;
-            }
-
-            // Build + scan source files
-            for (const file of sourceFiles) {
-                if (token.isCancellationRequested) break;
-                progress.report({ message: `Building ${path.basename(file.fsPath)}...`, increment: 100 / totalFiles });
-
-                try {
-                    // ── FIX 2: buildAndScan now actually works in batch mode ──
-                    const result = await this.buildAndScan(file.fsPath, false);
-                    if (result && result.is_malicious) {
-                        this.recordDetection();
-                        threats.push({
-                            file: path.basename(file.fsPath),
-                            severity: result.confidence === 'high' ? 'critical' : result.confidence,
-                            time: 'just now',
-                            prob: result.malicious_probability
-                        });
-                    }
-                } catch (err: any) {
-                    console.log(`Skipping ${file.fsPath}: ${err}`);
-                }
-                scanned++;
-            }
-
-            this.threatCount += threats.length;
-            this.recentDetections = [...threats, ...this.recentDetections].slice(0, 10);
-            this.updateStatusBar();
-            this.updateWebview();
-
-            if (threats.length > 0) {
-                vscode.window.showWarningMessage(`DAML: Found ${threats.length} potential threats!`);
-            } else {
-                vscode.window.showInformationMessage(`DAML: Scanned ${scanned} files. No threats.`);
-            }
-        }
-    );
-}
 
     public async scanActiveFile() {
         if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
@@ -481,8 +553,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
 
         await this.buildAndScan(sourcePath, true);
     }
-
-
 
     public async forceRebuildActiveFile() {
         await this.scanActiveFile();
@@ -557,42 +627,41 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     // ── Build & Scan ───────────────────────────────────────────────────────
 
     private async buildAndScan(sourcePath: string, showProgress: boolean): Promise<any | null> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
-    const fileName = path.basename(sourcePath);
-    const ext = path.extname(sourcePath).toLowerCase();
-    const baseName = path.basename(sourcePath, ext);
-    const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
+        const fileName = path.basename(sourcePath);
+        const ext = path.extname(sourcePath).toLowerCase();
+        const baseName = path.basename(sourcePath, ext);
+        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
 
-    // ── FIX: Only skip the interactive dialog in batch mode, not the whole build ──
-    if (showProgress) {
-        const action = await vscode.window.showWarningMessage(
-            `Build ${fileName} into EXE and scan?`, 
-            'Build & Scan', 
-            'Cancel'
-        );
-        if (action !== 'Build & Scan') return null;
-    }
-
-    await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `Building ${fileName}...`, cancellable: false },
-        async (progress) => {
-            progress.report({ message: 'Compiling...' });
-            try {
-                await this.runBuildCommand(sourcePath, workspaceRoot);
-            } catch (err: any) {
-                vscode.window.showErrorMessage(`Build failed: ${err.message || err}`);
-                throw err;
-            }
+        if (showProgress) {
+            const action = await vscode.window.showWarningMessage(
+                `Build ${fileName} into EXE and scan?`, 
+                'Build & Scan', 
+                'Cancel'
+            );
+            if (action !== 'Build & Scan') return null;
         }
-    );
 
-    if (!fs.existsSync(outFile)) {
-        vscode.window.showErrorMessage(`No .exe produced. Expected: dist/${baseName}.exe`);
-        return null;
+        await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: `Building ${fileName}...`, cancellable: false },
+            async (progress) => {
+                progress.report({ message: 'Compiling...' });
+                try {
+                    await this.runBuildCommand(sourcePath, workspaceRoot);
+                } catch (err: any) {
+                    vscode.window.showErrorMessage(`Build failed: ${err.message || err}`);
+                    throw err;
+                }
+            }
+        );
+
+        if (!fs.existsSync(outFile)) {
+            vscode.window.showErrorMessage(`No .exe produced. Expected: dist/${baseName}.exe`);
+            return null;
+        }
+
+        return this.scanBinary(outFile, showProgress);
     }
-
-    return this.scanBinary(outFile, showProgress);
-}
 
     // ── Build Commands (with compiler selection) ─────────────────────────
 
@@ -838,7 +907,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                     this.lastExplanation = { error: true, message: e.message || 'Explain failed' };
                 }
 
-
                 if (result.is_malicious) {
                     this.threatCount++;
                     this.recordDetection();
@@ -1011,13 +1079,11 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         }
     }
 
-        private getHtml(webview: vscode.Webview, scriptUri: vscode.Uri) {
-        // Build explanation panel HTML if available
+    private getHtml(webview: vscode.Webview, scriptUri: vscode.Uri) {
         let explanationHtml = '';
         if (this.lastExplanation) {
             const exp = this.lastExplanation;
 
-            // Error state
             if (exp.error) {
                 explanationHtml = `
                 <div class="card p-3 mt-3 bg-yellow-500/10 border-l-4 border-l-yellow-500">
@@ -1034,7 +1100,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 const predColor = exp.prediction === 'MALICIOUS' ? 'text-red-500' : 'text-green-500';
                 const predBg = exp.prediction === 'MALICIOUS' ? 'bg-red-500/10' : 'bg-green-500/10';
 
-                // Top features bars
                 const featureBars = exp.top_features.map((f: any) => {
                     const maxAttr = exp.top_features[0].attribution;
                     const pct = maxAttr > 0 ? (f.attribution / maxAttr * 100).toFixed(0) : '0';
@@ -1053,7 +1118,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 `;
                 }).join('');
 
-                // Group contributions
                 const groupBars = exp.groups.slice(0, 6).map((g: any) => {
                     const dirColor = g.direction === 'malicious' ? 'text-red-400' : 'text-green-400';
                     return `
@@ -1064,7 +1128,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 `;
                 }).join('');
 
-                // ── FIX: Render actionable recommendations instead of raw benign pushers ──
                 const recommendationsHtml = exp.recommendations && exp.recommendations.length > 0
                     ? exp.recommendations.map((rec: any) => `
                     <div class="mb-2 p-2 bg-[var(--border)]/30 rounded">
@@ -1128,8 +1191,6 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         const apiStatusPulse = this.apiAvailable ? '' : 'pulse';
         const apiStatusText = this.apiAvailable ? '' : '<span class="text-responsive-sm text-red-400 ml-2">Offline</span>';
 
-        return '<!DOCTYPE html>\n        <html>\n        <head>\n            <meta name="viewport" content="width=device-width, initial-scale=1.0">\n            <script src="https://cdn.tailwindcss.com"></script>\n            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n            <script src="https://unpkg.com/lucide@latest"></script>\n            <style>\n                :root {\n                    --bg: var(--vscode-sideBar-background);\n                    --fg: var(--vscode-foreground);\n                    --border: var(--vscode-widget-border);\n                    --card-bg: var(--vscode-editor-background);\n                    --hover-bg: var(--vscode-list-hoverBackground);\n                    --sidebar-width: 100%;\n                }\n                \n                /* Base responsive font scaling */\n                html { font-size: clamp(10px, 0.8vw + 6px, 14px); }\n                \n                body { \n                    background: var(--bg); \n                    color: var(--fg); \n                    font-family: var(--vscode-font-family); \n                    padding: clamp(8px, 1vw, 16px); \n                    overflow-x: hidden; \n                    min-height: 100vh;\n                }\n                \n                .card { \n                    background: var(--card-bg); \n                    border: 1px solid var(--border); \n                    border-radius: clamp(4px, 0.5vw, 8px); \n                }\n                \n                .chart-container { \n                    height: clamp(120px, 25vh, 200px); \n                    width: 100%; \n                    position: relative; \n                }\n                \n                /* Responsive text sizes */\n                .text-responsive { font-size: clamp(0.7rem, 0.8vw + 0.3rem, 1rem); }\n                .text-responsive-sm { font-size: clamp(0.6rem, 0.6vw + 0.2rem, 0.85rem); }\n                .text-responsive-lg { font-size: clamp(1.2rem, 2vw + 0.5rem, 2.5rem); }\n                .text-responsive-xs { font-size: clamp(0.55rem, 0.5vw + 0.15rem, 0.75rem); }\n                \n                /* Responsive spacing */\n                .p-responsive { padding: clamp(6px, 1vw, 12px); }\n                .gap-responsive { gap: clamp(4px, 0.8vw, 8px); }\n                \n                /* Responsive icons */\n                .icon-responsive { \n                    width: clamp(16px, 2vw, 24px); \n                    height: clamp(16px, 2vw, 24px); \n                }\n                .icon-responsive-sm { \n                    width: clamp(12px, 1.5vw, 16px); \n                    height: clamp(12px, 1.5vw, 16px); \n                }\n                \n                /* Detection list items */\n                .detection-item { \n                    padding: clamp(6px, 1vw, 10px); \n                    border-bottom: 1px solid var(--border);\n                }\n                .detection-empty { \n                    padding: clamp(12px, 2vw, 20px); \n                }\n                \n                /* Scrollbar */\n                ::-webkit-scrollbar { width: clamp(4px, 0.6vw, 8px); }\n                ::-webkit-scrollbar-thumb { \n                    background: var(--border); \n                    border-radius: clamp(2px, 0.3vw, 4px); \n                }\n                \n                /* Pulse animation */\n                .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }\n                @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }\n                \n                /* Grid responsive */\n                .grid-responsive { \n                    display: grid; \n                    grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); \n                    gap: clamp(4px, 1vw, 8px); \n                }\n                \n                /* Button responsive */\n                .btn-responsive {\n                    padding: clamp(4px, 0.8vw, 8px) clamp(6px, 1vw, 12px);\n                    font-size: clamp(0.65rem, 0.7vw + 0.2rem, 0.9rem);\n                    border-radius: clamp(3px, 0.4vw, 6px);\n                }\n                \n                /* Status header responsive */\n                .header-responsive {\n                    padding-bottom: clamp(6px, 1vw, 12px);\n                    margin-bottom: clamp(8px, 1.5vw, 16px);\n                }\n                \n                /* Chart canvas responsive */\n                canvas { max-height: 100% !important; }\n                \n                /* Hide on very small */\n                @media (max-width: 200px) {\n                    .hide-narrow { display: none; }\n                }\n                \n                /* Compact mode for very small sidebar */\n                @media (max-width: 180px) {\n                    .compact-hide { display: none; }\n                    .grid-responsive { grid-template-columns: 1fr; }\n                }\n            </style>\n        </head>\n        <body class="flex flex-col min-h-[100vh]">\n            <div class="flex flex-col space-y-4 flex-none">\n                <div class="flex justify-between items-center border-b border-[var(--border)] header-responsive">\n                    <div class="flex items-center gap-2 min-w-0">\n                        <i data-lucide="shield" class="icon-responsive ' + apiStatusClass + ' ' + apiStatusPulse + ' flex-shrink-0"></i>\n                        <h1 class="text-responsive font-bold uppercase tracking-wider opacity-80 truncate hide-narrow">DAML Status</h1>\n                        ' + apiStatusText + '\n                    </div>\n                    <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white btn-responsive flex-shrink-0 ' + (this.threatCount === 0 ? 'opacity-50' : '') + '" ' + (this.threatCount === 0 ? 'disabled' : '') + '>Clear</button>\n                </div>\n\n                <div class="grid-responsive">\n                    <div class="card p-responsive flex flex-col items-center justify-center text-center">\n                        <p class="text-responsive-xs opacity-60 uppercase mb-1"><i data-lucide="alert-triangle" class="icon-responsive-sm ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + ' inline"></i> <span class="hide-narrow">Threats</span></p>\n                        <p class="text-responsive-lg font-bold ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + '">' + this.threatCount + '</p>\n                    </div>\n                    <div class="card p-responsive flex flex-col items-center justify-center text-center">\n                        <p class="text-responsive-xs opacity-60 uppercase mb-1"><i data-lucide="activity" class="icon-responsive-sm ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> <span class="hide-narrow">API</span></p>\n                        <p class="text-responsive-lg font-bold ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + '">' + (this.apiAvailable ? 'ON' : 'OFF') + '</p>\n                    </div>\n                </div>\n\n                <div class="card p-2 chart-container">\n                    <div class="flex justify-between items-center mb-1">\n                        <span class="text-responsive-xs opacity-60 uppercase">Live Activity (60m)</span>\n                        <button id="reset-graph-btn" class="text-responsive-xs px-1.5 py-0.5 rounded bg-[var(--border)] hover:opacity-80 transition opacity-60">Reset</button>\n                    </div>\n                    <canvas id="rollingChart"></canvas>\n                </div>\n\n                <div>\n                    <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Actions</h2>\n                    <div class="grid-responsive">\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanPeFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="shield" class="icon-responsive text-blue-400"></i>\n                            <span class="compact-hide">Scan PE</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanWorkspace\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="folder-search" class="icon-responsive text-blue-400"></i>\n                            <span class="compact-hide">Workspace</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanActiveFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="file-search" class="icon-responsive text-purple-400"></i>\n                            <span class="compact-hide">Active File</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer" onclick="vscode.postMessage({command: \'resolveThreats\'})">\n                            <i data-lucide="check-circle" class="icon-responsive text-green-400"></i>\n                            <span class="compact-hide">Clear</span>\n                        </button>\n                    </div>\n                </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-grow overflow-hidden">\n                <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Recent Detections</h2>\n                <div class="card p-0 overflow-y-auto flex-grow" style="min-height: clamp(80px, 15vh, 150px);">\n                    <ul class="text-responsive divide-y divide-[var(--border)]">\n                        ' + (this.recentDetections.length > 0 ? detectionsList : emptyState) + '\n                    </ul>\n                </div>\n            </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-none">\n                <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Last Scan Explanation</h2>\n                ' + explanationHtml + '\n            </div>\n\n            <div class="mt-3 flex justify-between items-center text-responsive-xs opacity-50 border-t border-[var(--border)] pt-2 flex-none">\n                <span class="hide-narrow">EMBER-LSTM</span>\n                <span><i data-lucide="' + (this.apiAvailable ? 'check-circle' : 'x-circle') + '" class="icon-responsive-sm ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> ' + (this.apiAvailable ? 'Ready' : 'Disconnected') + '</span>\n            </div>\n\n            <script>\n                const vscode = acquireVsCodeApi();\n                document.getElementById(\'clear-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resolveThreats\'}));\n                document.getElementById(\'reset-graph-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resetGraph\'}));\n                lucide.createIcons();\n                \n                // Responsive chart sizing\n                const chartContainer = document.querySelector(\'.chart-container\');\n                const slots = Array.from({length: 12}, (_, i) => \'-\' + ((11-i)*5) + \'m\');\n                \n                const chart = new Chart(document.getElementById(\'rollingChart\'), {\n                    type: \'line\',\n                    data: { \n                        labels: slots, \n                        datasets: [{ \n                            label: \'Threats\', \n                            data: [' + this.rollingHistory.join(',') + '], \n                            borderColor: \'rgb(239,68,68)\', \n                            backgroundColor: \'rgba(239,68,68,0.1)\', \n                            fill: true, \n                            tension: 0.4, \n                            pointRadius: Math.max(2, Math.min(4, window.innerWidth / 200)), \n                            pointHoverRadius: Math.max(3, Math.min(6, window.innerWidth / 150)) \n                        }] \n                    },\n                    options: { \n                        responsive: true, \n                        maintainAspectRatio: false, \n                        plugins: { \n                            legend: { display: false } \n                        }, \n                        scales: { \n                            x: { \n                                display: true, \n                                ticks: { \n                                    maxTicksLimit: Math.max(4, Math.min(8, Math.floor(window.innerWidth / 80))), \n                                    font: { size: Math.max(8, Math.min(11, window.innerWidth / 80)) }, \n                                    color: \'var(--fg)\' \n                                }, \n                                grid: { display: false } \n                            }, \n                            y: { \n                                display: true, \n                                beginAtZero: true, \n                                ticks: { \n                                    font: { size: Math.max(8, Math.min(11, window.innerWidth / 80)) }, \n                                    color: \'var(--fg)\', \n                                    maxTicksLimit: Math.max(3, Math.min(5, Math.floor(window.innerHeight / 100))), \n                                    stepSize: 1 \n                                }, \n                                grid: { color: \'var(--border)\' } \n                            } \n                        } \n                    }\n                });\n                \n                // Resize observer for dynamic chart updates\n                const resizeObserver = new ResizeObserver(entries => {\n                    for (let entry of entries) {\n                        const width = entry.contentRect.width;\n                        chart.options.scales.x.ticks.font.size = Math.max(8, Math.min(11, width / 80));\n                        chart.options.scales.x.ticks.maxTicksLimit = Math.max(4, Math.min(8, Math.floor(width / 80)));\n                        chart.options.scales.y.ticks.font.size = Math.max(8, Math.min(11, width / 80));\n                        chart.update(\'none\');\n                    }\n                });\n                resizeObserver.observe(chartContainer);\n            </script>\n            <script src="' + scriptUri.toString() + '"></script>\n        </body>\n        </html>';
+        return '<!DOCTYPE html>\n        <html>\n        <head>\n            <meta name="viewport" content="width=device-width, initial-scale=1.0">\n            <script src="https://cdn.tailwindcss.com"></script>\n            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n            <script src="https://unpkg.com/lucide@latest"></script>\n            <style>\n                :root {\n                    --bg: var(--vscode-sideBar-background);\n                    --fg: var(--vscode-foreground);\n                    --border: var(--vscode-widget-border);\n                    --card-bg: var(--vscode-editor-background);\n                    --hover-bg: var(--vscode-list-hoverBackground);\n                    --sidebar-width: 100%;\n                }\n                \n                html { font-size: clamp(10px, 0.8vw + 6px, 14px); }\n                \n                body { \n                    background: var(--bg); \n                    color: var(--fg); \n                    font-family: var(--vscode-font-family); \n                    padding: clamp(8px, 1vw, 16px); \n                    overflow-x: hidden; \n                    min-height: 100vh;\n                }\n                \n                .card { \n                    background: var(--card-bg); \n                    border: 1px solid var(--border); \n                    border-radius: clamp(4px, 0.5vw, 8px); \n                }\n                \n                .chart-container { \n                    height: clamp(120px, 25vh, 200px); \n                    width: 100%; \n                    position: relative; \n                }\n                \n                .text-responsive { font-size: clamp(0.7rem, 0.8vw + 0.3rem, 1rem); }\n                .text-responsive-sm { font-size: clamp(0.6rem, 0.6vw + 0.2rem, 0.85rem); }\n                .text-responsive-lg { font-size: clamp(1.2rem, 2vw + 0.5rem, 2.5rem); }\n                .text-responsive-xs { font-size: clamp(0.55rem, 0.5vw + 0.15rem, 0.75rem); }\n                \n                .p-responsive { padding: clamp(6px, 1vw, 12px); }\n                .gap-responsive { gap: clamp(4px, 0.8vw, 8px); }\n                \n                .icon-responsive { \n                    width: clamp(16px, 2vw, 24px); \n                    height: clamp(16px, 2vw, 24px); \n                }\n                .icon-responsive-sm { \n                    width: clamp(12px, 1.5vw, 16px); \n                    height: clamp(12px, 1.5vw, 16px); \n                }\n                \n                .detection-item { \n                    padding: clamp(6px, 1vw, 10px); \n                    border-bottom: 1px solid var(--border);\n                }\n                .detection-empty { \n                    padding: clamp(12px, 2vw, 20px); \n                }\n                \n                ::-webkit-scrollbar { width: clamp(4px, 0.6vw, 8px); }\n                ::-webkit-scrollbar-thumb { \n                    background: var(--border); \n                    border-radius: clamp(2px, 0.3vw, 4px); \n                }\n                \n                .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }\n                @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }\n                \n                .grid-responsive { \n                    display: grid; \n                    grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); \n                    gap: clamp(4px, 1vw, 8px); \n                }\n                \n                .btn-responsive {\n                    padding: clamp(4px, 0.8vw, 8px) clamp(6px, 1vw, 12px);\n                    font-size: clamp(0.65rem, 0.7vw + 0.2rem, 0.9rem);\n                    border-radius: clamp(3px, 0.4vw, 6px);\n                }\n                \n                .header-responsive {\n                    padding-bottom: clamp(6px, 1vw, 12px);\n                    margin-bottom: clamp(8px, 1.5vw, 16px);\n                }\n                \n                canvas { max-height: 100% !important; }\n                \n                @media (max-width: 200px) {\n                    .hide-narrow { display: none; }\n                }\n                \n                @media (max-width: 180px) {\n                    .compact-hide { display: none; }\n                    .grid-responsive { grid-template-columns: 1fr; }\n                }\n            </style>\n        </head>\n        <body class="flex flex-col min-h-[100vh]">\n            <div class="flex flex-col space-y-4 flex-none">\n                <div class="flex justify-between items-center border-b border-[var(--border)] header-responsive">\n                    <div class="flex items-center gap-2 min-w-0">\n                        <i data-lucide="shield" class="icon-responsive ' + apiStatusClass + ' ' + apiStatusPulse + ' flex-shrink-0"></i>\n                        <h1 class="text-responsive font-bold uppercase tracking-wider opacity-80 truncate hide-narrow">DAML Status</h1>\n                        ' + apiStatusText + '\n                    </div>\n                    <button id="clear-btn" class="bg-blue-600 hover:bg-blue-500 text-white btn-responsive flex-shrink-0 ' + (this.threatCount === 0 ? 'opacity-50' : '') + '" ' + (this.threatCount === 0 ? 'disabled' : '') + '>Clear</button>\n                </div>\n\n                <div class="grid-responsive">\n                    <div class="card p-responsive flex flex-col items-center justify-center text-center">\n                        <p class="text-responsive-xs opacity-60 uppercase mb-1"><i data-lucide="alert-triangle" class="icon-responsive-sm ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + ' inline"></i> <span class="hide-narrow">Threats</span></p>\n                        <p class="text-responsive-lg font-bold ' + (this.threatCount > 0 ? 'text-red-500' : 'text-green-500') + '">' + this.threatCount + '</p>\n                    </div>\n                    <div class="card p-responsive flex flex-col items-center justify-center text-center">\n                        <p class="text-responsive-xs opacity-60 uppercase mb-1"><i data-lucide="activity" class="icon-responsive-sm ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> <span class="hide-narrow">API</span></p>\n                        <p class="text-responsive-lg font-bold ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + '">' + (this.apiAvailable ? 'ON' : 'OFF') + '</p>\n                    </div>\n                </div>\n\n                <div class="card p-2 chart-container">\n                    <div class="flex justify-between items-center mb-1">\n                        <span class="text-responsive-xs opacity-60 uppercase">Live Activity (60m)</span>\n                        <button id="reset-graph-btn" class="text-responsive-xs px-1.5 py-0.5 rounded bg-[var(--border)] hover:opacity-80 transition opacity-60">Reset</button>\n                    </div>\n                    <canvas id="rollingChart"></canvas>\n                </div>\n\n                <div>\n                    <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Actions</h2>\n                    <div class="grid-responsive">\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanPeFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="shield" class="icon-responsive text-blue-400"></i>\n                            <span class="compact-hide">Scan PE</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanWorkspace\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="folder-search" class="icon-responsive text-blue-400"></i>\n                            <span class="compact-hide">Workspace</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer ' + (!this.apiAvailable ? 'opacity-50' : '') + '" onclick="vscode.postMessage({command: \'scanActiveFile\'})" ' + (!this.apiAvailable ? 'disabled' : '') + '>\n                            <i data-lucide="file-search" class="icon-responsive text-purple-400"></i>\n                            <span class="compact-hide">Active File</span>\n                        </button>\n                        <button class="card p-responsive text-responsive flex flex-col items-center justify-center gap-1 hover:bg-[var(--hover-bg)] cursor-pointer" onclick="vscode.postMessage({command: \'resolveThreats\'})">\n                            <i data-lucide="check-circle" class="icon-responsive text-green-400"></i>\n                            <span class="compact-hide">Clear</span>\n                        </button>\n                    </div>\n                </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-grow overflow-hidden">\n                <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Recent Detections</h2>\n                <div class="card p-0 overflow-y-auto flex-grow" style="min-height: clamp(80px, 15vh, 150px);">\n                    <ul class="text-responsive divide-y divide-[var(--border)]">\n                        ' + (this.recentDetections.length > 0 ? detectionsList : emptyState) + '\n                    </ul>\n                </div>\n            </div>\n            </div>\n\n            <div class="mt-4 flex flex-col flex-none">\n                <h2 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">Last Scan Explanation</h2>\n                ' + explanationHtml + '\n            </div>\n\n            <div class="mt-3 flex justify-between items-center text-responsive-xs opacity-50 border-t border-[var(--border)] pt-2 flex-none">\n                <span class="hide-narrow">EMBER-LSTM</span>\n                <span><i data-lucide="' + (this.apiAvailable ? 'check-circle' : 'x-circle') + '" class="icon-responsive-sm ' + (this.apiAvailable ? 'text-green-500' : 'text-red-500') + ' inline"></i> ' + (this.apiAvailable ? 'Ready' : 'Disconnected') + '</span>\n            </div>\n\n            <script>\n                const vscode = acquireVsCodeApi();\n                document.getElementById(\'clear-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resolveThreats\'}));\n                document.getElementById(\'reset-graph-btn\')?.addEventListener(\'click\', () => vscode.postMessage({command: \'resetGraph\'}));\n                lucide.createIcons();\n                \n                const chartContainer = document.querySelector(\'.chart-container\');\n                const slots = Array.from({length: 12}, (_, i) => \'-\' + ((11-i)*5) + \'m\');\n                \n                const chart = new Chart(document.getElementById(\'rollingChart\'), {\n                    type: \'line\',\n                    data: { \n                        labels: slots, \n                        datasets: [{ \n                            label: \'Threats\', \n                            data: [' + this.rollingHistory.join(',') + '], \n                            borderColor: \'rgb(239,68,68)\', \n                            backgroundColor: \'rgba(239,68,68,0.1)\', \n                            fill: true, \n                            tension: 0.4, \n                            pointRadius: Math.max(2, Math.min(4, window.innerWidth / 200)), \n                            pointHoverRadius: Math.max(3, Math.min(6, window.innerWidth / 150)) \n                        }] \n                    },\n                    options: { \n                        responsive: true, \n                        maintainAspectRatio: false, \n                        plugins: { \n                            legend: { display: false } \n                        }, \n                        scales: { \n                            x: { \n                                display: true, \n                                ticks: { \n                                    maxTicksLimit: Math.max(4, Math.min(8, Math.floor(window.innerWidth / 80))), \n                                    font: { size: Math.max(8, Math.min(11, window.innerWidth / 80)) }, \n                                    color: \'var(--fg)\' \n                                }, \n                                grid: { display: false } \n                            }, \n                            y: { \n                                display: true, \n                                beginAtZero: true, \n                                ticks: { \n                                    font: { size: Math.max(8, Math.min(11, window.innerWidth / 80)) }, \n                                    color: \'var(--fg)\', \n                                    maxTicksLimit: Math.max(3, Math.min(5, Math.floor(window.innerHeight / 100))), \n                                    stepSize: 1 \n                                }, \n                                grid: { color: \'var(--border)\' } \n                            } \n                        } \n                    }\n                });\n                \n                const resizeObserver = new ResizeObserver(entries => {\n                    for (let entry of entries) {\n                        const width = entry.contentRect.width;\n                        chart.options.scales.x.ticks.font.size = Math.max(8, Math.min(11, width / 80));\n                        chart.options.scales.x.ticks.maxTicksLimit = Math.max(4, Math.min(8, Math.floor(width / 80)));\n                        chart.options.scales.y.ticks.font.size = Math.max(8, Math.min(11, width / 80));\n                        chart.update(\'none\');\n                    }\n                });\n                resizeObserver.observe(chartContainer);\n            </script>\n            <script src="' + scriptUri.toString() + '"></script>\n        </body>\n        </html>';
     }
 }
-
-export function deactivate() {}
