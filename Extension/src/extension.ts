@@ -364,67 +364,94 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     }
 
     public async scanWorkspace() {
-        if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
-        if (!this.apiAvailable) {
-            const action = await vscode.window.showWarningMessage(
-                'DAML API server not running. Start it with: uvicorn main:app --host 0.0.0.0 --port 8000',
-                'Retry',
-                'Cancel'
-            );
-            if (action === 'Retry') {
-                await this.checkApiHealth();
-                if (this.apiAvailable) this.scanWorkspace();
-            }
-            return;
-        }
-
-        vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: 'DAML Scanning Workspace...', cancellable: true },
-            async (progress, token) => {
-                const sourceFiles = await vscode.workspace.findFiles('**/*.{ts,js,py,cpp,c}', '**/node_modules/**', 50);
-
-                if (sourceFiles.length === 0) {
-                    vscode.window.showInformationMessage('No source files found.');
-                    return;
-                }
-
-                let scanned = 0;
-                const threats: typeof this.recentDetections = [];
-
-                for (const file of sourceFiles) {
-                    if (token.isCancellationRequested) break;
-                    progress.report({ message: `Processing ${path.basename(file.fsPath)}...`, increment: 100 / sourceFiles.length });
-
-                    try {
-                        const result = await this.buildAndScan(file.fsPath, false);
-                        if (result && result.is_malicious) {
-                            this.recordDetection();
-                            threats.push({
-                                file: path.basename(file.fsPath),
-                                severity: result.confidence === 'high' ? 'critical' : result.confidence,
-                                time: 'just now',
-                                prob: result.malicious_probability
-                            });
-                        }
-                    } catch (err: any) {
-                        console.log(`Skipping ${file.fsPath}: ${err}`);
-                    }
-                    scanned++;
-                }
-
-                this.threatCount += threats.length;
-                this.recentDetections = [...threats, ...this.recentDetections].slice(0, 10);
-                this.updateStatusBar();
-                this.updateWebview();
-
-                if (threats.length > 0) {
-                    vscode.window.showWarningMessage(`DAML: Found ${threats.length} potential threats!`);
-                } else {
-                    vscode.window.showInformationMessage(`DAML: Scanned ${scanned} files. No threats.`);
-                }
-            }
+    if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
+    if (!this.apiAvailable) {
+        const action = await vscode.window.showWarningMessage(
+            'DAML API server not running. Start it with: uvicorn main:app --host 0.0.0.0 --port 8000',
+            'Retry',
+            'Cancel'
         );
+        if (action === 'Retry') {
+            await this.checkApiHealth();
+            if (this.apiAvailable) this.scanWorkspace();
+        }
+        return;
     }
+
+    vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'DAML Scanning Workspace...', cancellable: true },
+        async (progress, token) => {
+            // ── FIX 1: Also look for existing EXEs ──
+            const exeFiles = await vscode.workspace.findFiles('**/*.exe', '**/node_modules/**', 50);
+            const sourceFiles = await vscode.workspace.findFiles('**/*.{ts,js,py,cpp,c}', '**/node_modules/**', 50);
+
+            if (exeFiles.length === 0 && sourceFiles.length === 0) {
+                vscode.window.showInformationMessage('No source files or compiled EXEs found.');
+                return;
+            }
+
+            let scanned = 0;
+            const threats: typeof this.recentDetections = [];
+            const totalFiles = exeFiles.length + sourceFiles.length;
+
+            // Scan existing EXEs directly (no rebuild needed)
+            for (const file of exeFiles) {
+                if (token.isCancellationRequested) break;
+                progress.report({ message: `Scanning ${path.basename(file.fsPath)}...`, increment: 100 / totalFiles });
+
+                try {
+                    const result = await this.scanBinary(file.fsPath, false);
+                    if (result && result.is_malicious) {
+                        this.recordDetection();
+                        threats.push({
+                            file: path.basename(file.fsPath),
+                            severity: result.confidence === 'high' ? 'critical' : result.confidence,
+                            time: 'just now',
+                            prob: result.malicious_probability
+                        });
+                    }
+                } catch (err: any) {
+                    console.log(`Skipping ${file.fsPath}: ${err}`);
+                }
+                scanned++;
+            }
+
+            // Build + scan source files
+            for (const file of sourceFiles) {
+                if (token.isCancellationRequested) break;
+                progress.report({ message: `Building ${path.basename(file.fsPath)}...`, increment: 100 / totalFiles });
+
+                try {
+                    // ── FIX 2: buildAndScan now actually works in batch mode ──
+                    const result = await this.buildAndScan(file.fsPath, false);
+                    if (result && result.is_malicious) {
+                        this.recordDetection();
+                        threats.push({
+                            file: path.basename(file.fsPath),
+                            severity: result.confidence === 'high' ? 'critical' : result.confidence,
+                            time: 'just now',
+                            prob: result.malicious_probability
+                        });
+                    }
+                } catch (err: any) {
+                    console.log(`Skipping ${file.fsPath}: ${err}`);
+                }
+                scanned++;
+            }
+
+            this.threatCount += threats.length;
+            this.recentDetections = [...threats, ...this.recentDetections].slice(0, 10);
+            this.updateStatusBar();
+            this.updateWebview();
+
+            if (threats.length > 0) {
+                vscode.window.showWarningMessage(`DAML: Found ${threats.length} potential threats!`);
+            } else {
+                vscode.window.showInformationMessage(`DAML: Scanned ${scanned} files. No threats.`);
+            }
+        }
+    );
+}
 
     public async scanActiveFile() {
         if (!this.isEnabled) return vscode.window.showWarningMessage('Enable DAML first.');
@@ -530,42 +557,42 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
     // ── Build & Scan ───────────────────────────────────────────────────────
 
     private async buildAndScan(sourcePath: string, showProgress: boolean): Promise<any | null> {
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
-        const fileName = path.basename(sourcePath);
-        const ext = path.extname(sourcePath).toLowerCase();
-        const baseName = path.basename(sourcePath, ext);
-        const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || '';
+    const fileName = path.basename(sourcePath);
+    const ext = path.extname(sourcePath).toLowerCase();
+    const baseName = path.basename(sourcePath, ext);
+    const outFile = path.join(workspaceRoot, 'dist', `${baseName}.exe`);
 
-        if (!showProgress) return null;
-
-        // Always build — simple and predictable
+    // ── FIX: Only skip the interactive dialog in batch mode, not the whole build ──
+    if (showProgress) {
         const action = await vscode.window.showWarningMessage(
             `Build ${fileName} into EXE and scan?`, 
             'Build & Scan', 
             'Cancel'
         );
         if (action !== 'Build & Scan') return null;
-
-        await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: `Building ${fileName}...`, cancellable: false },
-            async (progress) => {
-                progress.report({ message: 'Compiling...' });
-                try {
-                    await this.runBuildCommand(sourcePath, workspaceRoot);
-                } catch (err: any) {
-                    vscode.window.showErrorMessage(`Build failed: ${err.message || err}`);
-                    throw err;
-                }
-            }
-        );
-
-        if (!fs.existsSync(outFile)) {
-            vscode.window.showErrorMessage(`No .exe produced. Expected: dist/${baseName}.exe`);
-            return null;
-        }
-
-        return this.scanBinary(outFile, showProgress);
     }
+
+    await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Building ${fileName}...`, cancellable: false },
+        async (progress) => {
+            progress.report({ message: 'Compiling...' });
+            try {
+                await this.runBuildCommand(sourcePath, workspaceRoot);
+            } catch (err: any) {
+                vscode.window.showErrorMessage(`Build failed: ${err.message || err}`);
+                throw err;
+            }
+        }
+    );
+
+    if (!fs.existsSync(outFile)) {
+        vscode.window.showErrorMessage(`No .exe produced. Expected: dist/${baseName}.exe`);
+        return null;
+    }
+
+    return this.scanBinary(outFile, showProgress);
+}
 
     // ── Build Commands (with compiler selection) ─────────────────────────
 
@@ -984,7 +1011,7 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private getHtml(webview: vscode.Webview, scriptUri: vscode.Uri) {
+        private getHtml(webview: vscode.Webview, scriptUri: vscode.Uri) {
         // Build explanation panel HTML if available
         let explanationHtml = '';
         if (this.lastExplanation) {
@@ -1037,14 +1064,22 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 `;
                 }).join('');
 
-                const benignPushersHtml = exp.benign_pushers && exp.benign_pushers.length > 0
-                    ? exp.benign_pushers.slice(0, 8).map((bp: any) => `
-                    <div class="flex justify-between items-center text-responsive-xs py-1 border-b border-[var(--border)] last:border-0">
-                        <span class="opacity-80">${bp.feature}</span>
-                        <span class="text-green-400 font-mono">${bp.attribution.toFixed(4)} ↓</span>
+                // ── FIX: Render actionable recommendations instead of raw benign pushers ──
+                const recommendationsHtml = exp.recommendations && exp.recommendations.length > 0
+                    ? exp.recommendations.map((rec: any) => `
+                    <div class="mb-2 p-2 bg-[var(--border)]/30 rounded">
+                        <div class="text-responsive-xs font-bold opacity-80 mb-1">${rec.feature} <span class="opacity-50">(${rec.group})</span></div>
+                        <div class="text-responsive-xs opacity-70 leading-relaxed">${rec.advice}</div>
                     </div>
                 `).join('')
-                    : '<p class="text-responsive-xs opacity-50">No strong benign-pushing features detected.</p>';
+                    : (exp.benign_pushers && exp.benign_pushers.length > 0
+                        ? exp.benign_pushers.slice(0, 8).map((bp: any) => `
+                        <div class="flex justify-between items-center text-responsive-xs py-1 border-b border-[var(--border)] last:border-0">
+                            <span class="opacity-80">${bp.feature}</span>
+                            <span class="text-green-400 font-mono">${bp.attribution.toFixed(4)} ↓</span>
+                        </div>
+                    `).join('')
+                        : '<p class="text-responsive-xs opacity-50">No remediation advice available.</p>');
 
                 explanationHtml = `
             <div class="card p-3 mt-3 ${predBg} border-l-4 ${exp.prediction === 'MALICIOUS' ? 'border-l-red-500' : 'border-l-green-500'}">
@@ -1073,8 +1108,8 @@ class DamlDashboardProvider implements vscode.WebviewViewProvider {
                 </div>
                 
                 <div class="mt-3">
-                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">What Would Reduce the Score?</h4>
-                    ${benignPushersHtml}
+                    <h4 class="text-responsive-xs font-bold uppercase opacity-60 mb-2">How to Lower the Score</h4>
+                    ${recommendationsHtml}
                 </div>
             </div>
             `;

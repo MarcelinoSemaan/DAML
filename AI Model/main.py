@@ -197,6 +197,30 @@ def group_by_prefix(feat_name):
         return "other"
 
 
+def get_remediation_advice(feature_name: str):
+    """Return human-readable remediation for common malicious EMBER features."""
+    prefix = feature_name.split('.')[0] if '.' in feature_name else feature_name
+    
+    advice_map = {
+        "byteentropy": "Unpack the binary or avoid high-entropy packers (UPX, VMProtect).",
+        "histogram": "Avoid polymorphic/obfuscated byte patterns that distort the histogram.",
+        "section": "Remove packed sections and avoid RWX memory permissions.",
+        "sections": "Remove packed sections and avoid RWX memory permissions.",
+        "import": "Remove suspicious APIs: VirtualAlloc, WriteProcessMemory, CreateRemoteThread, InternetOpen.",
+        "imports": "Remove suspicious APIs: VirtualAlloc, WriteProcessMemory, CreateRemoteThread, InternetOpen.",
+        "export": "Add normal exports or remove obfuscated export tables.",
+        "exports": "Add normal exports or remove obfuscated export tables.",
+        "general": "Use normal file size and standard number of sections.",
+        "header": "Fix PE header anomalies (entry point, subsystem, checksum).",
+        "optional_header": "Fix optional header anomalies (image base, subsystem).",
+        "strings": "Strip suspicious strings: URLs, IPs, registry paths, cmd.exe, PowerShell.",
+        "datadirectories": "Restore standard data directory layout.",
+        "authenticode": "Sign the executable with a valid Authenticode certificate.",
+        "signature": "Sign the executable with a valid Authenticode certificate.",
+    }
+    return advice_map.get(prefix)
+
+
 def compute_attribution(model, tensor, feat_cols, n_cols, n_timesteps):
     """
     Compute feature attributions using gradient-based method.
@@ -273,13 +297,32 @@ def compute_attribution(model, tensor, feat_cols, n_cols, n_timesteps):
     benign_pushers.sort(key=lambda x: x["attribution"])
     benign_pushers = benign_pushers[:10]
 
+    # Generate actionable remediation for top malicious features
+    recommendations = []
+    seen_groups = set()
+    for f in top_features:
+        if f["direction"] == "malicious":
+            advice = get_remediation_advice(f["feature"])
+            if advice and f["group"] not in seen_groups:
+                recommendations.append({
+                    "feature": f["feature"],
+                    "group": f["group"],
+                    "advice": advice
+                })
+                seen_groups.add(f["group"])
+                if len(recommendations) >= 3:
+                    break
+
     return {
         "probability": prob,
         "prediction": "MALICIOUS" if prob >= 0.5 else "BENIGN",
         "top_features": top_features,
         "groups": groups,
-        "benign_pushers": benign_pushers
+        "benign_pushers": benign_pushers,
+        "recommendations": recommendations
     }
+
+
 # ── Lifespan / Startup ──────────────────────────────────────────────────────
 class State:
     def __init__(self):
@@ -357,6 +400,8 @@ class ExplainResponse(BaseModel):
     prediction: str
     top_features: list[dict]
     groups: list[dict]
+    benign_pushers: list[dict] = []
+    recommendations: list[dict] = []
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -517,6 +562,8 @@ def explain(req: PredictPathRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Explanation failed: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
